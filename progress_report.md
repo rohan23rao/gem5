@@ -12,7 +12,7 @@ We evaluate correctness using gem5's GPU random protocol tester and compare perf
 
 ## 2) What we've done so far
 
-- Studied the Spandex protocol specification (Alsop et al., ISCA 2018) and gem5's Ruby memory system architecture, including all GPU_VIPER SLICC controllers and the MOESI_AMD_Base directory
+- Studied the Spandex protocol specification and gem5's Ruby memory system architecture, including all GPU_VIPER SLICC controllers and the MOESI_AMD_Base directory
 - Designed the Spandex protocol mapping for GPU coherence: Load→ReqV, Store→ReqWT+D, Atomic→ReqO+D, Release→ReqWB, Acquire→self-invalidate
 - Created `Spandex-msg.sm`: defined SpandexRequestType and SpandexResponseType enumerations, SpandexRequestMsg and SpandexResponseMsg message structures, and VIPERCoalescer external class declaration for SLICC
 - Created `Spandex-TCP.sm`: full GPU L1 data cache controller with 3 states (Invalid, Valid, Atomic-waiting), 10 events, and complete transition table covering loads, write-through stores, atomics, flush/evict, and cache replacement
