@@ -52,6 +52,7 @@ SimObject('Sequencer.py', sim_objects=[
 if env['CONF']['BUILD_GPU']:
     SimObject('VIPERCoalescer.py', sim_objects=['VIPERCoalescer'])
     SimObject('VIPERSequencer.py', sim_objects=['VIPERSequencer'])
+    SimObject('SpandexCoalescer.py', sim_objects=['SpandexCoalescer'])
 
 Source('CacheRecorder.cc')
 Source('DMASequencer.cc')
@@ -65,3 +66,4 @@ Source('Sequencer.cc')
 if env['CONF']['BUILD_GPU']:
     Source('VIPERCoalescer.cc')
     Source('VIPERSequencer.cc')
+    Source('SpandexCoalescer.cc')

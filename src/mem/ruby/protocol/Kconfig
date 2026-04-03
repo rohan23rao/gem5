@@ -28,6 +28,10 @@ config RUBY_PROTOCOL_GPU_VIPER
     bool "GPU VIPER"
     depends on BUILD_GPU
     default n
+config RUBY_PROTOCOL_Spandex
+    bool "Spandex"
+    depends on BUILD_GPU
+    default n
 config RUBY_PROTOCOL_MOESI_AMD_Base
     bool "MOESI AMD base"
     default n

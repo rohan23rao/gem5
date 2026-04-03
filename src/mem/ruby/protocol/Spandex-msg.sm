@@ -1,1 +1,87 @@
 // Spandex Message Type Definitions
+
+enumeration(SpandexRequestType, desc="Spandex request types") {
+    ReqV,       desc="Request Valid copy (read, no ownership)";
+    ReqS,       desc="Request Shared (MESI S state)";
+    ReqWT,      desc="Write-Through, no data";
+    ReqWTD,     desc="Write-Through with Data";
+    ReqO,       desc="Request Ownership, no data";
+    ReqOD,      desc="Request Ownership with Data (atomics)";
+    ReqWB,      desc="Writeback / release ownership";
+}
+
+enumeration(SpandexResponseType, desc="Spandex response types") {
+    Data,       desc="Data response";
+    Ack,        desc="Write-through acknowledgment";
+    WBAck,      desc="Writeback acknowledgment";
+    AtomicResp, desc="Atomic response with data";
+    AtomicDone, desc="Atomic no-return acknowledgment";
+}
+
+structure(SpandexRequestMsg, desc="Spandex request message",
+          interface="Message") {
+    Addr addr,                      desc="Physical line address";
+    SpandexRequestType Type,        desc="Request type";
+    MachineID Requestor,            desc="Requesting node";
+    NetDest Destination,            desc="Destination";
+    DataBlock DataBlk,              desc="Data (for writes)";
+    WriteMask writeMask,            desc="Which bytes are valid";
+    MessageSizeType MessageSize,    desc="Size category";
+    uint64_t instSeqNum,            desc="Instruction sequence number";
+
+    bool functionalRead(Packet *pkt) {
+        if (Type == SpandexRequestType:ReqWTD ||
+            Type == SpandexRequestType:ReqOD ||
+            Type == SpandexRequestType:ReqWB) {
+            return testAndRead(addr, DataBlk, pkt);
+        }
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        return testAndWrite(addr, DataBlk, pkt);
+    }
+}
+
+structure(SpandexResponseMsg, desc="Spandex response message",
+          interface="Message") {
+    Addr addr,                       desc="Physical line address";
+    SpandexResponseType Type,        desc="Response type";
+    MachineID Sender,                desc="Sending node";
+    NetDest Destination,             desc="Destination";
+    DataBlock DataBlk,               desc="Data payload";
+    MessageSizeType MessageSize,     desc="Size category";
+    uint64_t instSeqNum,             desc="Instruction sequence number";
+
+    bool functionalRead(Packet *pkt) {
+        if (Type == SpandexResponseType:Data ||
+            Type == SpandexResponseType:AtomicResp) {
+            return testAndRead(addr, DataBlk, pkt);
+        }
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        return testAndWrite(addr, DataBlk, pkt);
+    }
+}
+
+// External C++ class declarations so SLICC can call methods on these objects
+structure(VIPERCoalescer, external="yes") {
+    void readCallback(Addr, DataBlock);
+    void readCallback(Addr, MachineType, DataBlock, bool);
+    void readCallback(Addr, MachineType, DataBlock,
+                      Cycles, Cycles, Cycles, bool);
+    void readCallback(Addr, MachineType, DataBlock,
+                      Cycles, Cycles, Cycles, bool, bool);
+    void writeCallback(Addr, DataBlock);
+    void writeCallback(Addr, MachineType, DataBlock);
+    void writeCallback(Addr, MachineType, DataBlock,
+                       Cycles, Cycles, Cycles);
+    void writeCallback(Addr, MachineType, DataBlock,
+                       Cycles, Cycles, Cycles, bool);
+    void atomicCallback(Addr, MachineType, DataBlock);
+    void invTCPCallback(Addr);
+    void writeCompleteCallback(Addr, uint64_t);
+    void evictionCallback(Addr);
+}

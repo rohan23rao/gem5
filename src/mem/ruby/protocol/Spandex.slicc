@@ -1,1 +1,5 @@
-// Spandex Protocol Manifest
+protocol "Spandex";
+include "Spandex-msg.sm";
+include "Spandex-TCP.sm";
+include "Spandex-SQC.sm";
+include "Spandex-dir.sm";
