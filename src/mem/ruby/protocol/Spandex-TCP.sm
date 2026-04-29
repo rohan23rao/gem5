@@ -1,1 +1,617 @@
 // Spandex GPU L1 Data Cache Controller
+
+machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
+ : VIPERCoalescer* coalescer;
+   Sequencer* sequencer;
+   bool use_seq_not_coal;
+   CacheMemory * L1cache;
+   bool WB; /*is this cache Writeback?*/
+   bool disableL1; /* bypass L1 cache? */
+   int TCC_select_num_bits;
+   Cycles issue_latency := 40;  // time to send request to directory
+   Cycles l2_hit_latency := 18;
+
+  MessageBuffer * requestFromTCP, network="To", virtual_network="1",
+        vnet_type="request";
+  MessageBuffer * responseToTCP, network="From", virtual_network="3",
+        vnet_type="response";
+  MessageBuffer * mandatoryQueue;
+
+{
+  state_declaration(State, desc="TCP Cache States", default="TCP_State_I") {
+    I, AccessPermission:Invalid,    desc="Invalid";
+    V, AccessPermission:Read_Only,  desc="Valid";
+    A, AccessPermission:Invalid,    desc="Waiting on Atomic";
+  }
+
+  enumeration(Event, desc="TCP Events") {
+    // Core initiated
+    Load,           desc="Load";
+    Store,          desc="Store (write-through)";
+    Atomic,         desc="Atomic operation";
+    Flush,          desc="Flush dirty data (release fence)";
+    Evict,          desc="Evict / self-invalidate (acquire fence)";
+    // Mem sys initiated
+    Repl,           desc="Cache replacement";
+    // Directory responses
+    DataResp,       desc="Data response from directory";
+    WTAck,          desc="Write-through acknowledgment";
+    AtomicResp,     desc="Atomic response with data from directory";
+    AtomicDone,     desc="Atomic no-return ack from directory";
+  }
+
+  enumeration(RequestType,
+              desc="To communicate stats from transitions to recordStats") {
+    DataArrayRead,    desc="Read the data array";
+    DataArrayWrite,   desc="Write the data array";
+    TagArrayRead,     desc="Read the tag array";
+    TagArrayWrite,    desc="Write the tag array";
+  }
+
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,           desc="cache state";
+    bool Dirty,                 desc="Is the data dirty?";
+    DataBlock DataBlk,          desc="data for the block";
+    WriteMask writeMask,        desc="written bytes masks";
+  }
+
+  structure(TBE, desc="...") {
+    State TBEState,     desc="Transient state";
+    DataBlock DataBlk,  desc="data for the block";
+    bool Dirty,         desc="Is the data dirty?";
+    int NumPendingMsgs, desc="Number of pending messages";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<TCP_TBE>", constructor="m_number_of_TBEs";
+  int TCC_select_low_bit, default="m_ruby_system->getBlockSizeBits()";
+
+  void set_cache_entry(AbstractCacheEntry b);
+  void unset_cache_entry();
+  void set_tbe(TBE b);
+  void unset_tbe();
+  void wakeUpAllBuffers();
+  void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+  Cycles curCycle();
+
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+
+  Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+    Entry cache_entry := static_cast(Entry, "pointer", L1cache.lookup(address));
+    return cache_entry;
+  }
+
+  DataBlock getDataBlock(Addr addr), return_by_ref="yes" {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      return tbe.DataBlk;
+    } else {
+      return getCacheEntry(addr).DataBlk;
+    }
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else if (is_valid(cache_entry)) {
+      testAndRead(addr, cache_entry.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+    num_functional_writes := num_functional_writes +
+        functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      return TCP_State_to_permission(tbe.TBEState);
+    }
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      return TCP_State_to_permission(cache_entry.CacheState);
+    }
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(TCP_State_to_permission(state));
+    }
+  }
+
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+        L1cache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+        L1cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+        L1cache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+        L1cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    }
+  }
+
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+      return L1cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+      return L1cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+      return L1cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+      return L1cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else {
+      error("Invalid RequestType in checkResourceAvailable");
+      return true;
+    }
+  }
+
+  // === OUT PORTS ===
+
+  out_port(requestNetwork_out, SpandexRequestMsg, requestFromTCP);
+
+  // === IN PORTS ===
+
+  in_port(responseToTCP_in, SpandexResponseMsg, responseToTCP) {
+    if (responseToTCP_in.isReady(clockEdge())) {
+      peek(responseToTCP_in, SpandexResponseMsg, block_on="addr") {
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs.lookup(in_msg.addr);
+
+        if (in_msg.Type == SpandexResponseType:Data) {
+          if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:DataResp, in_msg.addr, cache_entry, tbe);
+          } else {
+            Addr victim := L1cache.cacheProbe(in_msg.addr);
+            trigger(Event:Repl, victim, getCacheEntry(victim),
+                    TBEs.lookup(victim));
+          }
+        } else if (in_msg.Type == SpandexResponseType:Ack) {
+          trigger(Event:WTAck, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == SpandexResponseType:AtomicResp) {
+          if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:AtomicResp, in_msg.addr, cache_entry, tbe);
+          } else {
+            Addr victim := L1cache.cacheProbe(in_msg.addr);
+            trigger(Event:Repl, victim, getCacheEntry(victim),
+                    TBEs.lookup(victim));
+          }
+        } else if (in_msg.Type == SpandexResponseType:AtomicDone) {
+          trigger(Event:AtomicDone, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == SpandexResponseType:WBAck) {
+          trigger(Event:WTAck, in_msg.addr, cache_entry, tbe);
+        } else {
+          error("Unexpected response to TCP");
+        }
+      }
+    }
+  }
+
+  in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...") {
+    if (mandatoryQueue_in.isReady(clockEdge())) {
+      peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+        Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+        TBE tbe := TBEs.lookup(in_msg.LineAddress);
+        DPRINTF(RubySlicc, "%s\n", in_msg);
+
+        if (in_msg.Type == RubyRequestType:LD ||
+            in_msg.Type == RubyRequestType:IFETCH) {
+          trigger(Event:Load, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:ST) {
+          trigger(Event:Store, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:ATOMIC ||
+                   in_msg.Type == RubyRequestType:ATOMIC_RETURN ||
+                   in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN) {
+          trigger(Event:Atomic, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:FLUSH ||
+                   in_msg.Type == RubyRequestType:Release) {
+          trigger(Event:Flush, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:REPLACEMENT) {
+          trigger(Event:Evict, in_msg.LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == RubyRequestType:Acquire) {
+          trigger(Event:Evict, in_msg.LineAddress, cache_entry, tbe);
+        } else {
+          error("Unexpected Request Message to TCP");
+        }
+      }
+    }
+  }
+
+  // === ACTIONS ===
+
+  action(rv_sendReqV, "rv", desc="Send ReqV to directory for load") {
+    enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
+      out_msg.addr := address;
+      out_msg.Type := SpandexRequestType:ReqV;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:Directory,
+                              TCC_select_low_bit, TCC_select_num_bits));
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+    }
+  }
+
+  action(wt_sendReqWTD, "wt", desc="Send ReqWTD to directory (no alloc)") {
+    enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
+      peek(mandatoryQueue_in, RubyRequest) {
+        out_msg.addr := address;
+        out_msg.Type := SpandexRequestType:ReqWTD;
+        out_msg.Requestor := machineID;
+        out_msg.DataBlk.copyPartial(in_msg.WTData, in_msg.writeMask);
+        out_msg.writeMask := in_msg.writeMask;
+        out_msg.Destination.add(mapAddressToRange(address,
+                                MachineType:Directory,
+                                TCC_select_low_bit, TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(wtc_sendReqWTDFromCache, "wtc",
+         desc="Send ReqWTD from cache to directory") {
+    enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
+      out_msg.addr := address;
+      out_msg.Type := SpandexRequestType:ReqWTD;
+      out_msg.Requestor := machineID;
+      assert(is_valid(cache_entry));
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.writeMask.clear();
+      out_msg.writeMask.orMask(cache_entry.writeMask);
+      out_msg.Destination.add(mapAddressToRange(address,
+                              MachineType:Directory,
+                              TCC_select_low_bit, TCC_select_num_bits));
+      out_msg.MessageSize := MessageSizeType:Data;
+      peek(mandatoryQueue_in, RubyRequest) {
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(at_sendReqOD, "at", desc="Send ReqOD to directory for atomic") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
+        out_msg.addr := address;
+        out_msg.Type := SpandexRequestType:ReqOD;
+        out_msg.Requestor := machineID;
+        out_msg.writeMask.clear();
+        out_msg.writeMask.orMask(in_msg.writeMask);
+        out_msg.Destination.add(mapAddressToRange(address,
+                                MachineType:Directory,
+                                TCC_select_low_bit, TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(sf_sendReqWB, "sf", desc="Send ReqWB to directory for flush") {
+    enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
+      out_msg.addr := address;
+      out_msg.Type := SpandexRequestType:ReqWB;
+      out_msg.Requestor := machineID;
+      assert(is_valid(cache_entry));
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.writeMask.clear();
+      out_msg.writeMask.orMask(cache_entry.writeMask);
+      out_msg.Destination.add(mapAddressToRange(address,
+                              MachineType:Directory,
+                              TCC_select_low_bit, TCC_select_num_bits));
+      out_msg.MessageSize := MessageSizeType:Data;
+      peek(mandatoryQueue_in, RubyRequest) {
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(a_allocate, "a", desc="Allocate cache block") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L1cache.allocate(address, new Entry));
+    }
+    cache_entry.writeMask.clear();
+  }
+
+  action(ic_invCache, "ic", desc="Invalidate cache entry") {
+    if (is_valid(cache_entry)) {
+      cache_entry.writeMask.clear();
+      L1cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(t_allocateTBE, "t", desc="Allocate TBE") {
+    check_allocate(TBEs);
+    TBEs.allocate(address);
+    set_tbe(TBEs.lookup(address));
+  }
+
+  action(d_deallocateTBE, "d", desc="Deallocate TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(w_writeCache, "w", desc="Write data to cache from response") {
+    peek(responseToTCP_in, SpandexResponseMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.Dirty := false;
+    }
+  }
+
+  action(dw_dirtyWrite, "dw", desc="Write store data to cache entry") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      cache_entry.DataBlk.copyPartial(in_msg.WTData, in_msg.writeMask);
+      cache_entry.writeMask.orMask(in_msg.writeMask);
+    }
+  }
+
+  action(pm_popMandatoryQueue, "pm", desc="Pop mandatory queue") {
+    mandatoryQueue_in.dequeue(clockEdge());
+  }
+
+  action(pr_popResponseQueue, "pr", desc="Pop response queue") {
+    responseToTCP_in.dequeue(clockEdge());
+  }
+
+  action(ldh_loadDoneHit, "ldh", desc="Load hit callback") {
+    assert(is_valid(cache_entry));
+    if (use_seq_not_coal) {
+      sequencer.readCallback(address, cache_entry.DataBlk, true,
+                             MachineType:L1Cache);
+    } else {
+      coalescer.readCallback(address, MachineType:L1Cache,
+                             cache_entry.DataBlk, true);
+    }
+  }
+
+  action(ldm_loadDoneMiss, "ldm", desc="Load miss done callback") {
+    assert(is_valid(cache_entry));
+    if (use_seq_not_coal) {
+      sequencer.readCallback(address, cache_entry.DataBlk, false,
+                             MachineType:L1Cache);
+    } else {
+      coalescer.readCallback(address, MachineType:L1Cache,
+                             cache_entry.DataBlk, false);
+    }
+  }
+
+  action(sna_storeDoneNoAlloc, "sna", desc="Store done, no allocation") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      DataBlock tmp := in_msg.WTData;
+      if (use_seq_not_coal) {
+        sequencer.writeCallback(address, tmp, false, MachineType:L1Cache);
+      } else {
+        coalescer.writeCallback(address, MachineType:L1Cache, tmp);
+      }
+    }
+  }
+
+  action(sdh_storeDoneHit, "sdh", desc="Store hit callback") {
+    assert(is_valid(cache_entry));
+    if (use_seq_not_coal) {
+      sequencer.writeCallback(address, cache_entry.DataBlk, true,
+                              MachineType:L1Cache);
+    } else {
+      coalescer.writeCallback(address, MachineType:L1Cache,
+                              cache_entry.DataBlk);
+    }
+    cache_entry.Dirty := true;
+  }
+
+  action(ad_atomicDone, "ad", desc="Atomic done callback") {
+    assert(is_valid(cache_entry));
+    if (use_seq_not_coal) {
+      sequencer.atomicCallback(address, cache_entry.DataBlk, true,
+                               MachineType:L1Cache);
+    } else {
+      coalescer.atomicCallback(address, MachineType:L1Cache,
+                               cache_entry.DataBlk);
+    }
+  }
+
+  action(wd_wtDone, "wd", desc="Write-through done callback") {
+    if (use_seq_not_coal) {
+      // Sequencer considers the write complete when writeCallback was
+      // called at store time; nothing further to do on WTAck.
+    } else {
+      peek(responseToTCP_in, SpandexResponseMsg) {
+        coalescer.writeCompleteCallback(address, in_msg.instSeqNum);
+      }
+    }
+  }
+
+  action(inv_invDone, "inv", desc="Invalidation done callback") {
+    if (use_seq_not_coal) {
+      sequencer.invL1Callback();
+    } else {
+      coalescer.invTCPCallback(address);
+    }
+  }
+
+  action(st_stallAndWait, "st", desc="Stall and wait on address") {
+    stall_and_wait(mandatoryQueue_in, address);
+  }
+
+  action(wada_wakeUpDependents, "wada", desc="Wake up dependents") {
+    wakeUpAllBuffers(address);
+  }
+
+  action(mru_updateMRU, "mru", desc="Touch block for replacement") {
+    L1cache.setMRU(address);
+  }
+
+  action(uu_profileMiss, "\udm", desc="Profile demand miss") {
+    L1cache.profileDemandMiss();
+  }
+
+  action(uu_profileHit, "\udh", desc="Profile demand hit") {
+    L1cache.profileDemandHit();
+  }
+
+  // === TRANSITIONS ===
+
+  // Stall requests to lines with pending atomics
+  transition(A, {Load, Store, Atomic, Flush}) {
+    st_stallAndWait;
+  }
+
+  // --- Loads ---
+  transition(I, Load) {TagArrayRead} {
+    rv_sendReqV;
+    uu_profileMiss;
+    pm_popMandatoryQueue;
+  }
+
+  transition(V, Load) {TagArrayRead, DataArrayRead} {
+    ldh_loadDoneHit;
+    mru_updateMRU;
+    uu_profileHit;
+    pm_popMandatoryQueue;
+  }
+
+  // Data response from directory (completes a load miss)
+  transition(I, DataResp, V) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    a_allocate;
+    w_writeCache;
+    ldm_loadDoneMiss;
+    pr_popResponseQueue;
+  }
+
+  transition(V, DataResp, V) {TagArrayRead, DataArrayRead, DataArrayWrite} {
+    w_writeCache;
+    ldh_loadDoneHit;
+    pr_popResponseQueue;
+  }
+
+  // --- Stores (write-through) ---
+  transition(I, Store) {TagArrayRead} {
+    sna_storeDoneNoAlloc;
+    uu_profileMiss;
+    wt_sendReqWTD;
+    pm_popMandatoryQueue;
+  }
+
+  transition(V, Store, I) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    dw_dirtyWrite;
+    sdh_storeDoneHit;
+    uu_profileHit;
+    wtc_sendReqWTDFromCache;
+    ic_invCache;
+    pm_popMandatoryQueue;
+  }
+
+  // --- Atomics ---
+  transition({V, I}, Atomic, A) {TagArrayRead, TagArrayWrite} {
+    t_allocateTBE;
+    mru_updateMRU;
+    at_sendReqOD;
+    pm_popMandatoryQueue;
+  }
+
+  transition(A, AtomicResp, I) {TagArrayRead, DataArrayRead, DataArrayWrite} {
+    a_allocate;
+    w_writeCache;
+    ad_atomicDone;
+    ic_invCache;
+    wada_wakeUpDependents;
+    d_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  transition(A, AtomicDone, I) {
+    wada_wakeUpDependents;
+    d_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // --- Write-through ack (write complete) ---
+  transition({V, I}, WTAck) {
+    wd_wtDone;
+    pr_popResponseQueue;
+  }
+
+  transition(A, WTAck, I) {TagArrayRead, DataArrayRead, DataArrayWrite} {
+    a_allocate;
+    w_writeCache;
+    ad_atomicDone;
+    ic_invCache;
+    wada_wakeUpDependents;
+    d_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // --- Flush (release fence) ---
+  transition(V, Flush, I) {TagArrayRead, TagArrayWrite} {
+    sf_sendReqWB;
+    ic_invCache;
+    pm_popMandatoryQueue;
+  }
+
+  transition(I, Flush) {
+    pm_popMandatoryQueue;
+  }
+
+  // --- Evict (acquire fence / self-invalidate) ---
+  transition(V, Evict, I) {TagArrayRead, TagArrayWrite} {
+    inv_invDone;
+    ic_invCache;
+    pm_popMandatoryQueue;
+  }
+
+  transition(I, Evict) {
+    inv_invDone;
+    pm_popMandatoryQueue;
+  }
+
+  transition(A, Evict) {
+    inv_invDone;
+    pm_popMandatoryQueue;
+  }
+
+  // --- Replacement ---
+  transition({I, V}, Repl, I) {TagArrayRead, TagArrayWrite} {
+    ic_invCache;
+  }
+
+  transition(A, Repl) {TagArrayRead, TagArrayWrite} {
+    ic_invCache;
+  }
+}
