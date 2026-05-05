@@ -1,6 +1,12 @@
 protocol "Spandex";
-include "Spandex-msg.sm";
-include "Spandex-TCP.sm";
-include "Spandex-SQC.sm";
-include "Spandex-dir.sm";
-include "Spandex-DMA.sm";
+include "GPU_VIPER-msg.sm";     // CPURequestMsg, ResponseMsg, NBProbeRequestMsg,
+                                // UnblockMsg - all used by TCC and TU
+include "Spandex-msg.sm";       // SpandexRequestMsg, SpandexResponseMsg
+include "GPU_VIPER-TCP.sm";     // TCP L1 data cache (keeping the GPU coherence architecture intact) 
+include "GPU_VIPER-SQC.sm";     // SQC L1 instruction cache (keeping the GPU coherence intact)
+include "GPU_VIPER-TCC.sm";     // TCC L2 cache (keeping this intact as well - still talks to
+                                // Machine Type:Directory via vnets 0/2/4, 
+                                // but TU intercepts those messages)
+include "Spandex_TU.sm";        // Translation Unit between 'TCC and Spandex LLC'
+include "Spandex-dir.sm";       // Spandex LLC/Directory
+include "Spandex-DMA.sm";       // DMA Controller
