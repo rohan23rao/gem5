@@ -1,12 +1,16 @@
 protocol "Spandex";
-include "GPU_VIPER-msg.sm";     // CPURequestMsg, ResponseMsg, NBProbeRequestMsg,
-                                // UnblockMsg - all used by TCC and TU
-include "Spandex-msg.sm";       // SpandexRequestMsg, SpandexResponseMsg
-include "GPU_VIPER-TCP.sm";     // TCP L1 data cache (keeping the GPU coherence architecture intact) 
-include "GPU_VIPER-SQC.sm";     // SQC L1 instruction cache (keeping the GPU coherence intact)
-include "GPU_VIPER-TCC.sm";     // TCC L2 cache (keeping this intact as well - still talks to
-                                // Machine Type:Directory via vnets 0/2/4, 
-                                // but TU intercepts those messages)
-include "Spandex_TU.sm";        // Translation Unit between 'TCC and Spandex LLC'
+include "MOESI_AMD_Base-msg.sm"; // CPURequestMsg, ResponseMsg, NBProbeRequestMsg,
+                                 // UnblockMsg, CoherenceRequestType, ... — all
+                                 // actually live here (not in GPU_VIPER-msg.sm)
+include "GPU_VIPER-msg.sm";      // VIPERCoalescer external decl (depends on
+                                 // MOESI_AMD_Base-msg.sm types)
+include "Spandex-msg.sm";        // SpandexRequestMsg, SpandexResponseMsg
+include "GPU_VIPER-TCP.sm";     // TCP L1 data cache (unmodified)
+include "GPU_VIPER-SQC.sm";     // SQC L1 instruction cache (unmodified)
+include "Spandex_TU.sm";        // TU declares MachineType:TU; must come before
+                                // GPU_VIPER-TCC.sm because TCC.sm references
+                                // MachineType:TU as its NB destination.
+include "GPU_VIPER-TCC.sm";     // TCC L2; modified to send to MachineType:TU
+                                // instead of MachineType:Directory.
 include "Spandex-dir.sm";       // Spandex LLC/Directory
 include "Spandex-DMA.sm";       // DMA Controller

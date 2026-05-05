@@ -167,6 +167,8 @@ machine(MachineType:TU, "Spandex Translation Unit")
   void wakeUpAllBuffers(Addr a);
   void wakeUpAllBuffers();
   Cycles curCycle();
+  // Required for forwarding requests to the Spandex Directory by address
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
 
   // The TU has no cache, so getState / setState only consult the TBE.
   State getState(TBE tbe, Addr addr) {
@@ -188,7 +190,13 @@ machine(MachineType:TU, "Spandex Translation Unit")
   }
 
   int functionalWrite(Addr addr, Packet *pkt) {
-    return functionalMemoryWrite(pkt);
+    // SLICC: functionalMemoryWrite returns bool; the controller's
+    // functionalWrite must return int (count of writes performed). Use the
+    // canonical pattern from Spandex-dir.sm / GPU_VIPER-TCC.sm: accumulate
+    // into an int so the bool→int promotion happens via addition.
+    int num_functional_writes := 0;
+    num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+    return num_functional_writes;
   }
 
   AccessPermission getAccessPermission(Addr addr) {

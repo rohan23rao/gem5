@@ -96,7 +96,7 @@ class TCCCache(RubyCache):
 
 # ── Controller classes ────────────────────────────────────────────────────────
 
-class TCPCntrl(GPU_VIPER_TCP_Controller, CntrlBase):
+class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
     """
     GPU L1 data cache — uses the unmodified GPU_VIPER TCP controller.
     Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
@@ -194,7 +194,7 @@ class SQCCache(RubyCache):
             self.replacement_policy = ObjectList.rp_list.get(options.sqc_rp)()
 
 
-class SQCCntrl(GPU_VIPER_SQC_Controller, CntrlBase):
+class SQCCntrl(Spandex_SQC_Controller, CntrlBase):
     """
     GPU L1 instruction cache — uses unmodified GPU_VIPER SQC controller.
     Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
@@ -226,7 +226,7 @@ class SQCCntrl(GPU_VIPER_SQC_Controller, CntrlBase):
             self.recycle_latency = options.recycle_latency
 
 
-class TCCCntrl(GPU_VIPER_TCC_Controller, CntrlBase):
+class TCCCntrl(Spandex_TCC_Controller, CntrlBase):
     """
     GPU L2 shared cache — unmodified GPU_VIPER TCC controller.
     Receives CPURequestMsg from TCP/SQC on vnet 1.
@@ -398,6 +398,19 @@ def define_options(parser):
         default="16",
         help="Num of banks in L1 cache",
     )
+    # TCC parameters (mirroring GPU_VIPER.py so the unmodified VIPER TCC
+    # controller is fully configurable from the CLI)
+    parser.add_argument(
+        "--TCC_latency", type=int, default=16, help="TCC latency"
+    )
+    parser.add_argument(
+        "--WB_L2", action="store_true", default=False, help="writeback L2"
+    )
+    parser.add_argument(
+        "--glc_atomic_latency",
+        type=int, default=1,
+        help="TCC atomic latency for globally-coherent atomics",
+    )
 
 
 # ── construct_* functions ─────────────────────────────────────────────────────
@@ -476,7 +489,19 @@ def construct_tcps(options, system, ruby_system, network):
         tcp_cntrl.requestFromTCP = MessageBuffer(ordered=True)
         tcp_cntrl.requestFromTCP.out_port = network.in_port
 
-        # TCC → TCP: ResponseMsg on vnet 3
+        # TCP → TCC: outbound response on vnet 3 (used for some flows)
+        tcp_cntrl.responseFromTCP = MessageBuffer(ordered=True)
+        tcp_cntrl.responseFromTCP.out_port = network.in_port
+
+        # TCP → TCC: unblock on vnet 5
+        tcp_cntrl.unblockFromCore = MessageBuffer()
+        tcp_cntrl.unblockFromCore.out_port = network.in_port
+
+        # TCC → TCP: probe on vnet 1 (inbound)
+        tcp_cntrl.probeToTCP = MessageBuffer(ordered=True)
+        tcp_cntrl.probeToTCP.in_port = network.out_port
+
+        # TCC → TCP: ResponseMsg on vnet 3 (inbound)
         tcp_cntrl.responseToTCP = MessageBuffer(ordered=True)
         tcp_cntrl.responseToTCP.in_port = network.out_port
 
@@ -505,7 +530,11 @@ def construct_sqcs(options, system, ruby_system, network):
         sqc_cntrl.requestFromSQC = MessageBuffer(ordered=True)
         sqc_cntrl.requestFromSQC.out_port = network.in_port
 
-        # TCC → SQC: ResponseMsg on vnet 3
+        # TCC → SQC: probe on vnet 1 (inbound)
+        sqc_cntrl.probeToSQC = MessageBuffer(ordered=True)
+        sqc_cntrl.probeToSQC.in_port = network.out_port
+
+        # TCC → SQC: ResponseMsg on vnet 3 (inbound)
         sqc_cntrl.responseToSQC = MessageBuffer(ordered=True)
         sqc_cntrl.responseToSQC.in_port = network.out_port
 
@@ -527,46 +556,48 @@ def construct_tccs(options, system, ruby_system, network):
                if options.num_tccs > 1 else 0
 
     for i in range(options.num_tccs):
-        tcc_cntrl = TCCCntrl(
-            TCC_select_num_bits=tcc_bits,
-            number_of_TBEs=options.num_tbes,
-        )
+        # Match GPU_VIPER.py's TCC instantiation.
+        tcc_cntrl = TCCCntrl(l2_response_latency=options.TCC_latency)
         tcc_cntrl.create(options, ruby_system, system)
-
-        exec("ruby_system.tcc_cntrl%d = tcc_cntrl" % i)
-        tcc_cntrl_nodes.append(tcc_cntrl)
+        tcc_cntrl.l2_request_latency = options.gpu_to_dir_latency
+        tcc_cntrl.l2_response_latency = options.TCC_latency
+        tcc_cntrl.glc_atomic_latency = options.glc_atomic_latency
+        tcc_cntrl.WB = options.WB_L2
+        tcc_cntrl.number_of_TBEs = 2560 * options.num_compute_units
 
         # TCP/SQC → TCC: CPURequestMsg on vnet 1
         tcc_cntrl.requestFromTCP = MessageBuffer(ordered=True)
         tcc_cntrl.requestFromTCP.in_port = network.out_port
 
         # TCC → TCP/SQC: ResponseMsg on vnet 3
-        tcc_cntrl.responseToTCP = MessageBuffer(ordered=True)
-        tcc_cntrl.responseToTCP.out_port = network.in_port
+        tcc_cntrl.responseToCore = MessageBuffer(ordered=True)
+        tcc_cntrl.responseToCore.out_port = network.in_port
 
-        # TCC → TU: CPURequestMsg on vnet 0
-        # (TCC calls this requestToNB — now intercepted by TU)
+        # TU → TCC: probes (vnet 0). Unused in our flow but must be wired.
+        tcc_cntrl.probeFromNB = MessageBuffer()
+        tcc_cntrl.probeFromNB.in_port = network.out_port
+
+        # TU → TCC: data response (vnet 2). Synthesized by TU from Spandex Dir.
+        tcc_cntrl.responseFromNB = MessageBuffer()
+        tcc_cntrl.responseFromNB.in_port = network.out_port
+
+        # TCC → TU: outbound request (vnet 0). Originally requestToNB to dir.
         tcc_cntrl.requestToNB = MessageBuffer(ordered=True)
         tcc_cntrl.requestToNB.out_port = network.in_port
 
-        # TCC → TU: probe ack ResponseMsg on vnet 2 (unused but must be wired)
+        # TCC → TU: probe ack (vnet 2). Unused but must be wired.
         tcc_cntrl.responseToNB = MessageBuffer()
         tcc_cntrl.responseToNB.out_port = network.in_port
 
-        # TU → TCC: ResponseMsg on vnet 2
-        # (TCC calls this responseFromNB)
-        tcc_cntrl.responseFromNB = MessageBuffer(ordered=True)
-        tcc_cntrl.responseFromNB.in_port = network.out_port
-
-        # TCC → TU: UnblockMsg on vnet 4
-        # (TU absorbs these silently)
+        # TCC → TU: unblock (vnet 4). TU absorbs silently.
         tcc_cntrl.unblockToNB = MessageBuffer()
         tcc_cntrl.unblockToNB.out_port = network.in_port
 
-        # Probe port: TU → TCC on vnet 0
-        # (unused in this implementation — no probes from Spandex Dir)
-        tcc_cntrl.probeFromNB = MessageBuffer()
-        tcc_cntrl.probeFromNB.in_port = network.out_port
+        # Internal trigger queue (atomic ALU)
+        tcc_cntrl.triggerQueue = MessageBuffer(ordered=True)
+
+        exec("ruby_system.tcc_cntrl%d = tcc_cntrl" % i)
+        tcc_cntrl_nodes.append(tcc_cntrl)
 
     return tcc_cntrl_nodes
 
@@ -726,6 +757,9 @@ def construct_scalars(options, system, ruby_system, network):
         scalar_cntrl.requestFromSQC = MessageBuffer(ordered=True)
         scalar_cntrl.requestFromSQC.out_port = network.in_port
 
+        scalar_cntrl.probeToSQC = MessageBuffer(ordered=True)
+        scalar_cntrl.probeToSQC.in_port = network.out_port
+
         scalar_cntrl.responseToSQC = MessageBuffer(ordered=True)
         scalar_cntrl.responseToSQC.in_port = network.out_port
 
@@ -821,6 +855,12 @@ def create_system(
     #   2 — TU  → TCC responses / TCC → TU probe acks (stub)
     #   3 — Dir → TU responses /  TCC → TCP/SQC responses
     #   4 — TCC → TU unblock (absorbed by TU)
-    ruby_system.network.number_of_virtual_networks = 5
+    # vnet 0 = TCC↔TU + (CorePair) request
+    # vnet 1 = TCP/SQC↔TCC request + probe
+    # vnet 2 = TCC↔TU + (CorePair) response
+    # vnet 3 = TCC↔TCP/SQC response + TU↔Dir (Spandex) response
+    # vnet 4 = unblock from TCC
+    # vnet 5 = TCP unblock (declared by GPU_VIPER-TCP.sm)
+    ruby_system.network.number_of_virtual_networks = 6
 
     return (cpu_sequencers, dir_cntrl_nodes, mainCluster)
