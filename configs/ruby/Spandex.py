@@ -1,10 +1,15 @@
-# Spandex Coherence Protocol Configuration
+# Spandex Coherence Protocol Configuration — Architecture B
 #
-# Based on GPU_VIPER.py but simplified:
-# - No TCC (GPU L2) -- TCP talks directly to directory
-# - Directory has built-in L3 cache (no separate L3Cache controller)
-# - SpandexCoalescer instead of VIPERCoalescer
-# - No CPU CorePair or DMA controllers (GPU-only for now)
+# TCP → TCC → TU → Spandex Directory
+#
+# Key differences from Architecture A (teammate's version):
+# - GPU_VIPER TCC (L2 cache) is kept between TCP and the Spandex LLC
+# - A Translation Unit (TU) replaces the MOESI Northbridge interface
+#   that TCC used to talk to.  The TU translates:
+#     CPURequestMsg  (GPU_VIPER vocabulary) → SpandexRequestMsg
+#     SpandexResponseMsg                    → ResponseMsg (GPU_VIPER vocabulary)
+# - vnets 0/2/4 (TCC ↔ TU) and vnets 1/3 (TU ↔ Spandex Dir) are both needed,
+#   so number_of_virtual_networks = 5
 
 import math
 
@@ -53,6 +58,8 @@ class CntrlBase:
         return cls._version - 1
 
 
+# ── L1 cache config (shared by TCP and CPU controllers) ───────────────────────
+
 class TCPCache(RubyCache):
     size = "16KiB"
     assoc = 16
@@ -69,7 +76,32 @@ class TCPCache(RubyCache):
             self.replacement_policy = ObjectList.rp_list.get(options.tcp_rp)()
 
 
-class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
+# ── TCC L2 cache config ───────────────────────────────────────────────────────
+
+class TCCCache(RubyCache):
+    size = "256KiB"
+    assoc = 16
+    dataArrayBanks = 16
+    tagArrayBanks = 16
+    dataAccessLatency = 8
+    tagAccessLatency = 2
+
+    def create(self, options):
+        self.size = MemorySize(options.tcc_size)
+        self.assoc = options.tcc_assoc
+        self.resourceStalls = options.no_tcc_resource_stalls
+        if hasattr(options, "tcc_rp"):
+            self.replacement_policy = ObjectList.rp_list.get(options.tcc_rp)()
+
+
+# ── Controller classes ────────────────────────────────────────────────────────
+
+class TCPCntrl(GPU_VIPER_TCP_Controller, CntrlBase):
+    """
+    GPU L1 data cache — uses the unmodified GPU_VIPER TCP controller.
+    Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
+    TCC_select_num_bits selects which TCC (not Dir) to route to.
+    """
     def create(self, options, ruby_system, system):
         self.version = self.versionCount()
 
@@ -84,7 +116,7 @@ class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
         self.issue_latency = 1
         self.mandatory_queue_latency = options.mandatory_queue_latency
 
-        self.coalescer = SpandexCoalescer(ruby_system=ruby_system)
+        self.coalescer = VIPERCoalescer(ruby_system=ruby_system)
         self.coalescer.version = self.seqCount()
         self.coalescer.icache = self.L1cache
         self.coalescer.dcache = self.L1cache
@@ -115,10 +147,8 @@ class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
         if options.recycle_latency:
             self.recycle_latency = options.recycle_latency
 
-    # Variant used for host CPU cores: RubySequencer is the primary port,
-    # VIPERCoalescer is still instantiated because the TCP machine requires
-    # it, but use_seq_not_coal routes all callbacks through the sequencer.
     def createCP(self, options, ruby_system, system):
+        """CPU-core variant: routes callbacks through sequencer not coalescer."""
         self.version = self.versionCount()
 
         self.L1cache = TCPCache(
@@ -130,7 +160,7 @@ class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
         self.issue_latency = 1
         self.mandatory_queue_latency = options.mandatory_queue_latency
 
-        self.coalescer = SpandexCoalescer(ruby_system=ruby_system)
+        self.coalescer = VIPERCoalescer(ruby_system=ruby_system)
         self.coalescer.version = self.seqCount()
         self.coalescer.icache = self.L1cache
         self.coalescer.dcache = self.L1cache
@@ -145,7 +175,6 @@ class TCPCntrl(Spandex_TCP_Controller, CntrlBase):
         self.sequencer.is_cpu_sequencer = True
 
         self.use_seq_not_coal = True
-
         self.ruby_system = ruby_system
 
         if options.recycle_latency:
@@ -165,7 +194,11 @@ class SQCCache(RubyCache):
             self.replacement_policy = ObjectList.rp_list.get(options.sqc_rp)()
 
 
-class SQCCntrl(Spandex_SQC_Controller, CntrlBase):
+class SQCCntrl(GPU_VIPER_SQC_Controller, CntrlBase):
+    """
+    GPU L1 instruction cache — uses unmodified GPU_VIPER SQC controller.
+    Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
+    """
     def create(self, options, ruby_system, system):
         self.version = self.versionCount()
 
@@ -174,7 +207,6 @@ class SQCCntrl(Spandex_SQC_Controller, CntrlBase):
         self.L1cache.resourceStalls = options.no_resource_stalls
 
         self.sequencer = VIPERSequencer()
-
         self.sequencer.version = self.seqCount()
         self.sequencer.dcache = self.L1cache
         self.sequencer.ruby_system = ruby_system
@@ -194,6 +226,58 @@ class SQCCntrl(Spandex_SQC_Controller, CntrlBase):
             self.recycle_latency = options.recycle_latency
 
 
+class TCCCntrl(GPU_VIPER_TCC_Controller, CntrlBase):
+    """
+    GPU L2 shared cache — unmodified GPU_VIPER TCC controller.
+    Receives CPURequestMsg from TCP/SQC on vnet 1.
+    Sends CPURequestMsg to TU on vnet 0 (TCC thinks it's talking to NB/Dir).
+    Receives ResponseMsg from TU on vnet 2.
+    Sends UnblockMsg to TU on vnet 4.
+    """
+    def create(self, options, ruby_system, system):
+        self.version = self.versionCount()
+
+        self.L2cache = TCCCache()
+        self.L2cache.create(options)
+        self.L2cache.resourceStalls = options.no_tcc_resource_stalls
+
+        self.ruby_system = ruby_system
+        if hasattr(options, "gpu_clock") and hasattr(options, "gpu_voltage"):
+            self.clk_domain = SrcClockDomain(
+                clock=options.gpu_clock,
+                voltage_domain=VoltageDomain(voltage=options.gpu_voltage),
+            )
+
+        if options.recycle_latency:
+            self.recycle_latency = options.recycle_latency
+
+        self.number_of_TBEs = options.num_tbes
+        self.WB = options.WB_L1
+
+
+class TUCntrl(Spandex_TU_Controller, CntrlBase):
+    """
+    Translation Unit — new controller for Architecture B.
+    Sits between GPU_VIPER TCC and Spandex Directory.
+
+    Upward  (TCC side):
+      requestFromTCC  — vnet 0  CPURequestMsg  (TCC → TU)
+      responseToTCC   — vnet 2  ResponseMsg    (TU  → TCC)
+      unblockFromTCC  — vnet 4  UnblockMsg     (TCC → TU, absorbed)
+
+    Downward (Spandex Dir side):
+      requestToDir    — vnet 1  SpandexRequestMsg  (TU  → Dir)
+      responseFromDir — vnet 3  SpandexResponseMsg (Dir → TU)
+    """
+    def create(self, options, ruby_system, system):
+        self.version = self.versionCount()
+        self.ruby_system = ruby_system
+        self.number_of_TBEs = options.num_tbes
+
+        if options.recycle_latency:
+            self.recycle_latency = options.recycle_latency
+
+
 class L3Cache(RubyCache):
     dataArrayBanks = 16
     tagArrayBanks = 16
@@ -204,8 +288,6 @@ class L3Cache(RubyCache):
         self.assoc = options.l3_assoc
         self.dataArrayBanks /= options.num_dirs
         self.tagArrayBanks /= options.num_dirs
-        self.dataArrayBanks /= options.num_dirs
-        self.tagArrayBanks /= options.num_dirs
         self.dataAccessLatency = options.l3_data_latency
         self.tagAccessLatency = options.l3_tag_latency
         self.resourceStalls = False
@@ -213,6 +295,11 @@ class L3Cache(RubyCache):
 
 
 class DirCntrl(Spandex_Directory_Controller, CntrlBase):
+    """
+    Spandex LLC + Directory.
+    Receives SpandexRequestMsg from TU on vnet 1.
+    Sends SpandexResponseMsg back to TU on vnet 3.
+    """
     def create(self, options, dir_ranges, ruby_system, system):
         self.version = self.versionCount()
 
@@ -227,12 +314,13 @@ class DirCntrl(Spandex_Directory_Controller, CntrlBase):
         self.L3cache.create(options, ruby_system, system)
 
         self.number_of_TBEs = options.num_tbes
-
         self.ruby_system = ruby_system
 
         if options.recycle_latency:
             self.recycle_latency = options.recycle_latency
 
+
+# ── Option definitions ────────────────────────────────────────────────────────
 
 def define_options(parser):
     parser.add_argument("--num-subcaches", type=int, default=4)
@@ -247,9 +335,7 @@ def define_options(parser):
         "--no-tcc-resource-stalls", action="store_false", default=True
     )
     parser.add_argument("--num-tbes", type=int, default=256)
-    parser.add_argument(
-        "--l2-latency", type=int, default=50,
-    )
+    parser.add_argument("--l2-latency", type=int, default=50)
     parser.add_argument(
         "--sqc-size", type=str, default="32KiB", help="SQC cache size"
     )
@@ -277,13 +363,25 @@ def define_options(parser):
         help="Hit latency for TCP",
     )
     parser.add_argument(
-        "--tcp-size", type=str, default="16KiB", help="tcp size"
+        "--tcp-size", type=str, default="16KiB", help="TCP cache size"
     )
-    parser.add_argument("--tcp-assoc", type=int, default=16, help="tcp assoc")
+    parser.add_argument(
+        "--tcp-assoc", type=int, default=16, help="TCP cache assoc"
+    )
     parser.add_argument(
         "--tcp-deadlock-threshold",
         type=int,
         help="Set the TCP deadlock threshold to some value",
+    )
+    # TCC options (new for Architecture B)
+    parser.add_argument(
+        "--tcc-size", type=str, default="256KiB", help="TCC L2 cache size"
+    )
+    parser.add_argument(
+        "--tcc-assoc", type=int, default=16, help="TCC L2 cache assoc"
+    )
+    parser.add_argument(
+        "--num-tccs", type=int, default=1, help="Number of TCC controllers"
     )
     parser.add_argument(
         "--max-coalesces-per-cycle",
@@ -292,7 +390,7 @@ def define_options(parser):
         help="Maximum insts that may coalesce in a cycle",
     )
     parser.add_argument(
-        "--noL1", action="store_true", default=False, help="bypassL1"
+        "--noL1", action="store_true", default=False, help="bypass L1"
     )
     parser.add_argument(
         "--tcp-num-banks",
@@ -302,10 +400,11 @@ def define_options(parser):
     )
 
 
+# ── construct_* functions ─────────────────────────────────────────────────────
+
 def construct_dirs(options, system, ruby_system, network):
     dir_cntrl_nodes = []
 
-    # Number of bits to select among directories
     dir_bits = int(math.log(options.num_dirs, 2))
     block_size_bits = int(math.log(options.cacheline_size, 2))
 
@@ -330,12 +429,11 @@ def construct_dirs(options, system, ruby_system, network):
         dir_cntrl.create(options, dir_ranges, ruby_system, system)
         dir_cntrl.number_of_TBEs = options.num_tbes
 
-        # Connect directory to network
-        # requestToDir: incoming requests from TCP/SQC (vnet 1)
+        # Spandex Dir receives SpandexRequestMsg from TU on vnet 1
         dir_cntrl.requestToDir = MessageBuffer(ordered=True)
         dir_cntrl.requestToDir.in_port = network.out_port
 
-        # responseFromDir: outgoing responses to TCP/SQC (vnet 3)
+        # Spandex Dir sends SpandexResponseMsg back to TU on vnet 3
         dir_cntrl.responseFromDir = MessageBuffer()
         dir_cntrl.responseFromDir.out_port = network.in_port
 
@@ -353,12 +451,13 @@ def construct_tcps(options, system, ruby_system, network):
     tcp_sequencers = []
     tcp_cntrl_nodes = []
 
-    # Use dir_bits for address-to-directory mapping (no TCC)
-    dir_bits = int(math.log(options.num_dirs, 2))
+    # TCC_select_num_bits selects among TCCs (not Dirs)
+    tcc_bits = int(math.log(options.num_tccs, 2)) \
+               if options.num_tccs > 1 else 0
 
     for i in range(options.num_compute_units):
         tcp_cntrl = TCPCntrl(
-            TCC_select_num_bits=dir_bits,
+            TCC_select_num_bits=tcc_bits,
             issue_latency=1,
             number_of_TBEs=2560,
         )
@@ -373,10 +472,11 @@ def construct_tcps(options, system, ruby_system, network):
         tcp_sequencers.append(tcp_cntrl.coalescer)
         tcp_cntrl_nodes.append(tcp_cntrl)
 
-        # Connect TCP to network
+        # TCP → TCC: CPURequestMsg on vnet 1
         tcp_cntrl.requestFromTCP = MessageBuffer(ordered=True)
         tcp_cntrl.requestFromTCP.out_port = network.in_port
 
+        # TCC → TCP: ResponseMsg on vnet 3
         tcp_cntrl.responseToTCP = MessageBuffer(ordered=True)
         tcp_cntrl.responseToTCP.in_port = network.out_port
 
@@ -389,10 +489,11 @@ def construct_sqcs(options, system, ruby_system, network):
     sqc_sequencers = []
     sqc_cntrl_nodes = []
 
-    dir_bits = int(math.log(options.num_dirs, 2))
+    tcc_bits = int(math.log(options.num_tccs, 2)) \
+               if options.num_tccs > 1 else 0
 
     for i in range(options.num_sqc):
-        sqc_cntrl = SQCCntrl(TCC_select_num_bits=dir_bits)
+        sqc_cntrl = SQCCntrl(TCC_select_num_bits=tcc_bits)
         sqc_cntrl.create(options, ruby_system, system)
 
         exec("ruby_system.sqc_cntrl%d = sqc_cntrl" % i)
@@ -400,10 +501,11 @@ def construct_sqcs(options, system, ruby_system, network):
         sqc_sequencers.append(sqc_cntrl.sequencer)
         sqc_cntrl_nodes.append(sqc_cntrl)
 
-        # Connect SQC to network
+        # SQC → TCC: CPURequestMsg on vnet 1
         sqc_cntrl.requestFromSQC = MessageBuffer(ordered=True)
         sqc_cntrl.requestFromSQC.out_port = network.in_port
 
+        # TCC → SQC: ResponseMsg on vnet 3
         sqc_cntrl.responseToSQC = MessageBuffer(ordered=True)
         sqc_cntrl.responseToSQC.in_port = network.out_port
 
@@ -412,16 +514,138 @@ def construct_sqcs(options, system, ruby_system, network):
     return (sqc_sequencers, sqc_cntrl_nodes)
 
 
+def construct_tccs(options, system, ruby_system, network):
+    """
+    Create GPU_VIPER TCC (L2) controllers.
+    TCC sits between TCP/SQC and the TU.
+    Its NB-facing ports (vnet 0/2/4) are connected to the network;
+    the TU intercepts those messages.
+    """
+    tcc_cntrl_nodes = []
+
+    tcc_bits = int(math.log(options.num_tccs, 2)) \
+               if options.num_tccs > 1 else 0
+
+    for i in range(options.num_tccs):
+        tcc_cntrl = TCCCntrl(
+            TCC_select_num_bits=tcc_bits,
+            number_of_TBEs=options.num_tbes,
+        )
+        tcc_cntrl.create(options, ruby_system, system)
+
+        exec("ruby_system.tcc_cntrl%d = tcc_cntrl" % i)
+        tcc_cntrl_nodes.append(tcc_cntrl)
+
+        # TCP/SQC → TCC: CPURequestMsg on vnet 1
+        tcc_cntrl.requestFromTCP = MessageBuffer(ordered=True)
+        tcc_cntrl.requestFromTCP.in_port = network.out_port
+
+        # TCC → TCP/SQC: ResponseMsg on vnet 3
+        tcc_cntrl.responseToTCP = MessageBuffer(ordered=True)
+        tcc_cntrl.responseToTCP.out_port = network.in_port
+
+        # TCC → TU: CPURequestMsg on vnet 0
+        # (TCC calls this requestToNB — now intercepted by TU)
+        tcc_cntrl.requestToNB = MessageBuffer(ordered=True)
+        tcc_cntrl.requestToNB.out_port = network.in_port
+
+        # TCC → TU: probe ack ResponseMsg on vnet 2 (unused but must be wired)
+        tcc_cntrl.responseToNB = MessageBuffer()
+        tcc_cntrl.responseToNB.out_port = network.in_port
+
+        # TU → TCC: ResponseMsg on vnet 2
+        # (TCC calls this responseFromNB)
+        tcc_cntrl.responseFromNB = MessageBuffer(ordered=True)
+        tcc_cntrl.responseFromNB.in_port = network.out_port
+
+        # TCC → TU: UnblockMsg on vnet 4
+        # (TU absorbs these silently)
+        tcc_cntrl.unblockToNB = MessageBuffer()
+        tcc_cntrl.unblockToNB.out_port = network.in_port
+
+        # Probe port: TU → TCC on vnet 0
+        # (unused in this implementation — no probes from Spandex Dir)
+        tcc_cntrl.probeFromNB = MessageBuffer()
+        tcc_cntrl.probeFromNB.in_port = network.out_port
+
+    return tcc_cntrl_nodes
+
+
+def construct_tus(options, system, ruby_system, network):
+    """
+    Create Translation Unit controllers — one per TCC.
+    The TU intercepts TCC's NB-facing messages and translates them
+    to/from Spandex Directory vocabulary.
+
+    Upward  (TCC side, vnets 0/2/4):
+      requestFromTCC  vnet 0 in  — CPURequestMsg from TCC
+      responseToTCC   vnet 2 out — ResponseMsg to TCC
+      unblockFromTCC  vnet 4 in  — UnblockMsg from TCC (absorbed)
+      probeToTCC      vnet 0 out — NBProbeRequestMsg (unused stub)
+      probeAckFromTCC vnet 2 in  — ResponseMsg probe ack (unused stub)
+
+    Downward (Spandex Dir side, vnets 1/3):
+      requestToDir    vnet 1 out — SpandexRequestMsg to Spandex Dir
+      responseFromDir vnet 3 in  — SpandexResponseMsg from Spandex Dir
+    """
+    tu_cntrl_nodes = []
+
+    for i in range(options.num_tccs):
+        tu_cntrl = TUCntrl(
+            TCC_select_num_bits=0,   # TU is 1:1 with Dir, no selection needed
+            number_of_TBEs=options.num_tbes,
+        )
+        tu_cntrl.create(options, ruby_system, system)
+
+        exec("ruby_system.tu_cntrl%d = tu_cntrl" % i)
+        tu_cntrl_nodes.append(tu_cntrl)
+
+        # ── Upward ports (TCC side) ──────────────────────────────────────
+
+        # TCC → TU: CPURequestMsg on vnet 0
+        tu_cntrl.requestFromTCC = MessageBuffer(ordered=True)
+        tu_cntrl.requestFromTCC.in_port = network.out_port
+
+        # TU → TCC: ResponseMsg on vnet 2
+        tu_cntrl.responseToTCC = MessageBuffer(ordered=True)
+        tu_cntrl.responseToTCC.out_port = network.in_port
+
+        # TCC → TU: UnblockMsg on vnet 4 (absorbed silently by TU)
+        tu_cntrl.unblockFromTCC = MessageBuffer()
+        tu_cntrl.unblockFromTCC.in_port = network.out_port
+
+        # TU → TCC: NBProbeRequestMsg on vnet 0 (unused stub)
+        tu_cntrl.probeToTCC = MessageBuffer()
+        tu_cntrl.probeToTCC.out_port = network.in_port
+
+        # # TCC → TU: probe ack ResponseMsg on vnet 2 (unused stub)
+        # tu_cntrl.probeAckFromTCC = MessageBuffer()
+        # tu_cntrl.probeAckFromTCC.in_port = network.out_port
+
+        # ── Downward ports (Spandex Dir side) ───────────────────────────
+
+        # TU → Spandex Dir: SpandexRequestMsg on vnet 1
+        tu_cntrl.requestToDir = MessageBuffer(ordered=True)
+        tu_cntrl.requestToDir.out_port = network.in_port
+
+        # Spandex Dir → TU: SpandexResponseMsg on vnet 3
+        tu_cntrl.responseFromDir = MessageBuffer(ordered=True)
+        tu_cntrl.responseFromDir.in_port = network.out_port
+
+    return tu_cntrl_nodes
+
+
 def construct_cpus(options, system, ruby_system, network):
     cpu_sequencers_local = []
     cpu_cntrl_nodes = []
 
-    dir_bits = int(math.log(options.num_dirs, 2))
+    tcc_bits = int(math.log(options.num_tccs, 2)) \
+               if options.num_tccs > 1 else 0
 
     num_cpus = getattr(options, "num_cpus", 0)
     for i in range(num_cpus):
         cpu_cntrl = TCPCntrl(
-            TCC_select_num_bits=dir_bits,
+            TCC_select_num_bits=tcc_bits,
             issue_latency=1,
             number_of_TBEs=256,
         )
@@ -487,10 +711,11 @@ def construct_scalars(options, system, ruby_system, network):
     scalar_sequencers = []
     scalar_cntrl_nodes = []
 
-    dir_bits = int(math.log(options.num_dirs, 2))
+    tcc_bits = int(math.log(options.num_tccs, 2)) \
+               if options.num_tccs > 1 else 0
 
     for i in range(options.num_scalar_cache):
-        scalar_cntrl = SQCCntrl(TCC_select_num_bits=dir_bits)
+        scalar_cntrl = SQCCntrl(TCC_select_num_bits=tcc_bits)
         scalar_cntrl.create(options, ruby_system, system)
 
         exec("ruby_system.scalar_cntrl%d = scalar_cntrl" % i)
@@ -509,6 +734,8 @@ def construct_scalars(options, system, ruby_system, network):
     return (scalar_sequencers, scalar_cntrl_nodes)
 
 
+# ── create_system ─────────────────────────────────────────────────────────────
+
 def create_system(
     options, full_system, system, dma_devices, bootmem, ruby_system, cpus
 ):
@@ -518,17 +745,34 @@ def create_system(
     cpu_sequencers = []
 
     mainCluster = Cluster(intBW=8)
-    cpuCluster = Cluster(extBW=8, intBW=8)
-    gpuCluster = Cluster(extBW=8, intBW=8)
+    cpuCluster  = Cluster(extBW=8, intBW=8)
+    gpuCluster  = Cluster(extBW=8, intBW=8)
 
-    # Create directory controllers (LLC + directory combined)
+    # ── Spandex Directory (LLC) ──────────────────────────────────────────
     dir_cntrl_nodes = construct_dirs(
         options, system, ruby_system, ruby_system.network
     )
     for dir_cntrl in dir_cntrl_nodes:
         mainCluster.add(dir_cntrl)
 
-    # Create CPU controllers FIRST so their sequencers come before GPU ports
+    # ── Translation Units (one per TCC) ─────────────────────────────────
+    # Add TUs before TCCs so they are registered with the network first.
+    # This ensures the TU MachineIDs are known before TCC routing is set up.
+    tu_cntrl_nodes = construct_tus(
+        options, system, ruby_system, ruby_system.network
+    )
+    for tu_cntrl in tu_cntrl_nodes:
+        gpuCluster.add(tu_cntrl)
+
+    # ── GPU_VIPER TCC (L2) ───────────────────────────────────────────────
+    tcc_cntrl_nodes = construct_tccs(
+        options, system, ruby_system, ruby_system.network
+    )
+    for tcc_cntrl in tcc_cntrl_nodes:
+        gpuCluster.add(tcc_cntrl)
+
+    # ── CPU controllers ──────────────────────────────────────────────────
+    # Created before GPU TCP so CPU sequencers come first in cpu_sequencers
     # (apu_se.py expects _cpu_ports[0..num_cpus-1] to be CPU sequencers)
     (cpu_seqs, cpu_cntrl_nodes) = construct_cpus(
         options, system, ruby_system, ruby_system.network
@@ -537,7 +781,7 @@ def create_system(
     for cpu_cntrl in cpu_cntrl_nodes:
         cpuCluster.add(cpu_cntrl)
 
-    # Create TCPs (GPU L1 data caches)
+    # ── GPU TCP (L1 data caches) ─────────────────────────────────────────
     (tcp_sequencers, tcp_cntrl_nodes) = construct_tcps(
         options, system, ruby_system, ruby_system.network
     )
@@ -545,7 +789,7 @@ def create_system(
     for tcp_cntrl in tcp_cntrl_nodes:
         gpuCluster.add(tcp_cntrl)
 
-    # Create SQCs (GPU L1 instruction caches)
+    # ── GPU SQC (L1 instruction caches) ─────────────────────────────────
     (sqc_sequencers, sqc_cntrl_nodes) = construct_sqcs(
         options, system, ruby_system, ruby_system.network
     )
@@ -553,7 +797,7 @@ def create_system(
     for sqc_cntrl in sqc_cntrl_nodes:
         gpuCluster.add(sqc_cntrl)
 
-    # Create Scalar caches (reuse SQC controller)
+    # ── Scalar caches (reuse SQC controller) ────────────────────────────
     (scalar_sequencers, scalar_cntrl_nodes) = construct_scalars(
         options, system, ruby_system, ruby_system.network
     )
@@ -561,18 +805,22 @@ def create_system(
     for scalar_cntrl in scalar_cntrl_nodes:
         gpuCluster.add(scalar_cntrl)
 
-    # DMA controllers (HSA packet processor, GPU command processor in apu_se.py)
+    # ── DMA controllers ──────────────────────────────────────────────────
     dma_cntrl_nodes = construct_dmas(
         options, system, ruby_system, ruby_system.network, dma_devices
     )
     for dma_cntrl in dma_cntrl_nodes:
         gpuCluster.add(dma_cntrl)
 
-    # No TCC -- TCP talks directly to directory
     mainCluster.add(cpuCluster)
     mainCluster.add(gpuCluster)
 
-    # We use vnets 1 (requests) and 3 (responses), so need at least 4
-    ruby_system.network.number_of_virtual_networks = 4
+    # vnets used:
+    #   0 — TCC → TU requests  /  TU → TCC probes (stub)
+    #   1 — TU  → Dir requests /  TCP/SQC → TCC requests
+    #   2 — TU  → TCC responses / TCC → TU probe acks (stub)
+    #   3 — Dir → TU responses /  TCC → TCP/SQC responses
+    #   4 — TCC → TU unblock (absorbed by TU)
+    ruby_system.network.number_of_virtual_networks = 5
 
     return (cpu_sequencers, dir_cntrl_nodes, mainCluster)

@@ -1,0 +1,693 @@
+/* 
+*  Spandex Translation Unit for GPU VIPER 
+*
+*  Sits between GPU-VIPER TCC (L2 cache) and the Spandex Directory (LLC)
+*  The TCC was originally wired to the MOESI_AMD_Base Northbridge/Directory.
+*  The TU replaces that NB Interface for this architecture
+*  Translating the GPU_VIPER protocol Vocab into the Spandex protocol Vocab and vice versa.
+* 
+* --- Upward Interface (facing TCC) ------------------------------------------------------------
+*  Receives: CPURequestMsg            on vnet 0 (TCC -> TU, same as the TCC -> NB previously)
+*  Sends:    ResponseMsg              on vnet 2 (TU -> TCC, like NBSysResp / NBSysWBAck)
+*  Receives: UnblockMsg               on vnet 4 (TCC -> TU, after TCC gets the data)
+*  Sends:    NBProbeRequestMsg        on vnet 0 (TU -> TCC, probe forwarding - stub)
+*  Receives: ResponseMsg              on vnet 2 (TCC -> TU, probe ack - stub)
+*
+* --- Downward Interface (facing Spandex LLC) --------------------------------------------------
+*  Sends:     SpandexRequestMsg       on vnet 1 (TU -> Spandex Dir)
+*  Receives:  SpandexResponseMsg      on vnet 3 (Spandex Dir -> TU)
+*
+* --- Translation Table  -----------------------------------------------------------------------
+*
+* Upward (CPURequestMsg -> SpandexRequestMsg):
+*  RdBlk                ->  ReqV
+*  WriteThrough         ->  ReqWTD  (carries DataBlk + writeMask)
+*  WriteFlush           ->  ReqWB   (carries DataBlk + writeMask)
+*  wb_writeBack         ->  ReqWB   (TCC eviction writback, no CURequestor)
+*  AtomicReturn         ->  ReqOD   (atomic with return value)
+*  AtomicNoReturn       ->  ReqOD   (atomic without return value)
+*
+* Downward (SpandexResponseMsg -> SpandexRequestMsg)
+*  Data                        ->  NBSysResp  (carries DataBlk + CURequestor)
+*  Ack                         ->  NBSysWBAck (write-through ack)
+*  WBAck                       ->  NBSysWBAck (writeback ack)
+*  AtomicResp                  ->  NBSysResp  (carries DataBlk + CURequestor)
+*  AtomicDone                  ->  NBSysWBAck (atomic no-return ack)
+*
+* --- CURequestor pass-through -----------------------------------------------------------------
+*  The TCC sets CURequestor = original TCP when it calls rd_requestData /
+*  wt_writeThrough / at_atomicThrough.  The MOESI NB echoes this field back
+*  so TCC knows which TCP to forward the response to.
+*  The TU saves CURequestor in its TBE and injects it into the synthetic
+*  ResponseMsg it sends back to TCC, preserving the existing TCC behaviour
+*  exactly — TCC never needs to know the NB has been replaced.
+*
+* --- UnblockMsg handling ----------------------------------------------------------------------
+*  TCC sends an UnblockMsg to the NB (vnet 4) after every sdr_sendDataResponse
+*  and rb_bypassDone.  The Spandex Dir has no unblock mechanism, so the TU
+*  silently absorbs these messages (pops them without forwarding).
+*
+* --- Probe handling ---------------------------------------------------------------------------
+*  The MOESI NB sends PrbInv / PrbDowngrade probes to TCC (vnet 0).
+*  The Spandex Dir has no probe mechanism, so the TU never generates probes.
+*  The probe port and responseToNB port are declared (TCC requires them) but
+*  no transitions use them in the initial implementation.
+*/
+
+machine(MachineType:TU, "Spandex Translation Unit")
+  : Cycles tu_latency := 1;
+    int TCC_select_num_bits;
+    int number_of_TBEs := 256;
+
+  // ── Upward ports (TCC side, mirroring what MOESI NB exposed to TCC) ──
+
+  // Requests from TCC (vnet 0) — same buffer TCC called requestToNB
+  MessageBuffer * requestFromTCC, network="From",
+                  virtual_network="0", vnet_type="request";
+
+  // Probe requests TO TCC (vnet 0) — TCC has probeFromNB on this vnet.
+  // Declared here so the network wiring is symmetric; unused in this impl.
+  MessageBuffer * probeToTCC, network="To",
+                  virtual_network="0", vnet_type="request";
+
+  // Responses TO TCC (vnet 2) — TCC reads responseFromNB on this vnet
+  MessageBuffer * responseToTCC, network="To",
+                  virtual_network="2", vnet_type="response";
+
+  // Unblock messages FROM TCC (vnet 4) — absorbed silently
+  MessageBuffer * unblockFromTCC, network="From",
+                  virtual_network="4", vnet_type="unblock";
+
+  // ── Downward ports (Spandex Directory side) ──────────────────────────
+
+  // Requests TO Spandex Directory (vnet 1)
+  MessageBuffer * requestToDir, network="To",
+                  virtual_network="1", vnet_type="request";
+
+  // Responses FROM Spandex Directory (vnet 3)
+  MessageBuffer * responseFromDir, network="From",
+                  virtual_network="3", vnet_type="response";
+
+{
+  // ── STATES ─────────────────────────────────────────────────────────────
+  //
+  // The TU has no cache.  State is per-address in the TBE only.
+  // A TBE entry exists only while a request is in-flight to Spandex Dir.
+  //
+  state_declaration(State, desc="TU per-address states",
+                    default="TU_State_I") {
+    I,  AccessPermission:Invalid,
+          desc="Idle — no outstanding request for this address";
+    W,  AccessPermission:Busy,
+          desc="Waiting — request forwarded to Spandex Dir, awaiting response";
+    }
+
+  // ── EVENTS ─────────────────────────────────────────────────────────────
+  enumeration(Event, desc="TU events") {
+    // ── From TCC (CPURequestMsg on vnet 0) ──
+    // These map 1:1 to the CoherenceRequestType values TCC sends
+    RdBlk,          desc="Read miss — TCC forwarding RdBlk to NB";
+    WriteThrough,   desc="Write-through with data — TCC wt_writeThrough";
+    WriteBack,      desc="Eviction writeback — TCC wb_writeBack (no CURequestor)";
+    WriteFlush,     desc="Flush writeback — TCC f_flush";
+    AtomicReturn,   desc="Atomic needing return value — TCC at_atomicThrough";
+    AtomicNoReturn, desc="Atomic not needing return value — TCC at_atomicThrough";
+
+    // ── From Spandex Directory (SpandexResponseMsg on vnet 3) ──
+    SpxData,        desc="Data response — maps to NBSysResp";
+    SpxAck,         desc="Write-through ack — maps to NBSysWBAck";
+    SpxWBAck,       desc="Writeback ack — maps to NBSysWBAck";
+    SpxAtomicResp,  desc="Atomic with return data — maps to NBSysResp";
+    SpxAtomicDone,  desc="Atomic no-return done — maps to NBSysWBAck";
+
+    // ── From TCC (UnblockMsg on vnet 4) ──
+    Unblock,        desc="TCC unblock after receiving data — absorbed silently";
+  }
+
+  // ── TBE ────────────────────────────────────────────────────────────────
+  //
+  // One TBE per in-flight address.  We must save enough context from the
+  // incoming CPURequestMsg to reconstruct the ResponseMsg that TCC expects.
+  //
+  structure(TBE, desc="In-flight request state") {
+    State    TBEState,      desc="Transient state (always W while allocated)";
+
+    // The TCC machine that sent this request.  Used as Destination when we
+    // synthesise the response back.  This is what MOESI NB called
+    // tbe.OriginalRequestor — the TCC's own machineID.
+    MachineID TCCRequestor, desc="TCC that issued this request";
+
+    // The original TCP that triggered the TCC miss, saved from
+    // CPURequestMsg.CURequestor.  Must be echoed back in the ResponseMsg
+    // so TCC's sdr_sendDataResponse can route data to the right TCP.
+    MachineID CURequestor,  desc="Original TCP — echoed back to TCC";
+
+    // Pass-through fields that TCC expects back in the response
+    bool     isGLCSet,      desc="GLC bypass flag";
+    bool     isSLCSet,      desc="SLC bypass flag";
+    uint64_t instSeqNum,    desc="Instruction sequence number";
+    WriteMask writeMask,    desc="Write mask (for atomic TBE tracking)";
+    bool     atomicReturn,  desc="True if this was an AtomicReturn request";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<TU_TBE>", constructor="m_number_of_TBEs";
+
+  // ── SLICC boilerplate ──────────────────────────────────────────────────
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+  void set_tbe(TBE b);
+  void unset_tbe();
+  void wakeUpAllBuffers(Addr a);
+  void wakeUpAllBuffers();
+  Cycles curCycle();
+
+  // The TU has no cache, so getState / setState only consult the TBE.
+  State getState(TBE tbe, Addr addr) {
+    if (is_valid(tbe)) { return tbe.TBEState; }
+    return State:I;
+  }
+
+  void setState(TBE tbe, Addr addr, State state) {
+    if (is_valid(tbe)) { tbe.TBEState := state; }
+  }
+
+  // Functional read/write are required by the Ruby infrastructure.
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    if (is_valid(tbe)) {
+      // No data held in TBE for reads; fall through to memory.
+    }
+    functionalMemoryRead(pkt);
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    return functionalMemoryWrite(pkt);
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if (is_valid(tbe)) {
+      return TU_State_to_permission(tbe.TBEState);
+    }
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Addr addr, State state) {
+    // No cache entry — nothing to update.
+  }
+
+  // ── OUT PORTS ──────────────────────────────────────────────────────────
+  out_port(requestToDir_out,  SpandexRequestMsg, requestToDir);
+  out_port(responseToTCC_out, ResponseMsg,       responseToTCC);
+  // probeToTCC_out declared for completeness; unused in this implementation
+  out_port(probeToTCC_out,    NBProbeRequestMsg, probeToTCC);
+
+  // ── IN PORT: UnblockMsg from TCC (vnet 4) ─────────────────────────────
+  // Priority 0 — handle first to keep vnet 4 from backing up
+  in_port(unblockFromTCC_in, UnblockMsg, unblockFromTCC, rank=0) {
+    if (unblockFromTCC_in.isReady(clockEdge())) {
+      peek(unblockFromTCC_in, UnblockMsg) {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        // Spandex Dir has no unblock mechanism — absorb silently.
+        trigger(Event:Unblock, in_msg.addr, tbe);
+      }
+    }
+  }
+
+  // ── IN PORT: SpandexResponseMsg from Spandex Directory (vnet 3) ───────
+  // Priority 1
+  in_port(responseFromDir_in, SpandexResponseMsg, responseFromDir, rank=1) {
+    if (responseFromDir_in.isReady(clockEdge())) {
+      peek(responseFromDir_in, SpandexResponseMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        if (in_msg.Type == SpandexResponseType:Data) {
+          trigger(Event:SpxData, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:Ack) {
+          trigger(Event:SpxAck, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:WBAck) {
+          trigger(Event:SpxWBAck, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:AtomicResp) {
+          trigger(Event:SpxAtomicResp, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:AtomicDone) {
+          trigger(Event:SpxAtomicDone, in_msg.addr, tbe);
+        } else {
+          error("TU: unexpected SpandexResponseMsg type from Spandex Dir");
+        }
+      }
+    }
+  }
+
+  // ── IN PORT: CPURequestMsg from TCC (vnet 0) ──────────────────────────
+  // Priority 2 — lowest; only processed when response port is empty
+  in_port(requestFromTCC_in, CPURequestMsg, requestFromTCC, rank=2) {
+    if (requestFromTCC_in.isReady(clockEdge())) {
+      peek(requestFromTCC_in, CPURequestMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        if (in_msg.Type == CoherenceRequestType:RdBlk) {
+          trigger(Event:RdBlk, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:WriteThrough) {
+          // Distinguish wb_writeBack (CURequestor == Requestor, both TCC)
+          // from wt_writeThrough (CURequestor == original TCP).
+          // In wb_writeBack TCC sets CURequestor := machineID (itself).
+          if (in_msg.CURequestor == in_msg.Requestor) {
+            trigger(Event:WriteBack, in_msg.addr, tbe);
+          } else {
+            trigger(Event:WriteThrough, in_msg.addr, tbe);
+          }
+        } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
+          trigger(Event:WriteFlush, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:AtomicReturn) {
+          trigger(Event:AtomicReturn, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
+          trigger(Event:AtomicNoReturn, in_msg.addr, tbe);
+        } else {
+          DPRINTF(RubySlicc, "TU: unexpected CPURequestMsg type: %s\n",
+                  in_msg.Type);
+          error("TU: unexpected CPURequestMsg type from TCC");
+        }
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // ACTIONS
+  // ══════════════════════════════════════════════════════════════════════
+
+  // ── TBE management ────────────────────────────────────────────────────
+
+  action(t_allocateTBE, "t", desc="Allocate TBE and save TCC request context") {
+    check_allocate(TBEs);
+    TBEs.allocate(address);
+    set_tbe(TBEs.lookup(address));
+    peek(requestFromTCC_in, CPURequestMsg) {
+      tbe.TCCRequestor := in_msg.Requestor;   // TCC's own machineID
+      tbe.CURequestor  := in_msg.CURequestor; // original TCP from TCC
+      tbe.isGLCSet     := in_msg.isGLCSet;
+      tbe.isSLCSet     := in_msg.isSLCSet;
+      tbe.instSeqNum   := in_msg.instSeqNum;
+      tbe.writeMask    := in_msg.writeMask;
+      tbe.atomicReturn :=
+        (in_msg.Type == CoherenceRequestType:AtomicReturn);
+      DPRINTF(RubySlicc,
+        "TU: allocated TBE addr=%#x TCC=%s CU=%s\n",
+        address, in_msg.Requestor, in_msg.CURequestor);
+    }
+  }
+
+  action(dt_deallocateTBE, "dt", desc="Deallocate TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  // ── Upward translation: CPURequestMsg → SpandexRequestMsg ─────────────
+
+  // RdBlk → ReqV
+  action(tr_translateRead, "tr",
+         desc="Translate RdBlk → ReqV and forward to Spandex Dir") {
+    peek(requestFromTCC_in, CPURequestMsg) {
+      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := SpandexRequestType:ReqV;
+        out_msg.Requestor   := machineID;  // TU is the requestor to Dir
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: RdBlk->ReqV addr=%#x from TCC=%s for TCP=%s\n",
+          address, in_msg.Requestor, in_msg.CURequestor);
+      }
+    }
+  }
+
+
+  // WriteThrough (with CURequestor = TCP) → ReqWTD
+  action(twt_translateWriteThrough, "twt",
+         desc="Translate WriteThrough → ReqWTD and forward to Spandex Dir") {
+    peek(requestFromTCC_in, CPURequestMsg) {
+      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := SpandexRequestType:ReqWTD;
+        out_msg.Requestor   := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.writeMask   := in_msg.writeMask;
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: WriteThrough->ReqWTD addr=%#x\n", address);
+      }
+    }
+  }
+
+  // WriteBack (TCC eviction, CURequestor == TCC itself) → ReqWB
+  action(twb_translateWriteBack, "twb",
+         desc="Translate wb_writeBack → ReqWB and forward to Spandex Dir") {
+    peek(requestFromTCC_in, CPURequestMsg) {
+      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := SpandexRequestType:ReqWB;
+        out_msg.Requestor   := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.writeMask   := in_msg.writeMask;
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: WriteBack(evict)->ReqWB addr=%#x\n", address);
+      }
+    }
+  }
+
+  // WriteFlush → ReqWB
+  action(tf_translateFlush, "tf",
+         desc="Translate WriteFlush → ReqWB and forward to Spandex Dir") {
+    peek(requestFromTCC_in, CPURequestMsg) {
+      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := SpandexRequestType:ReqWB;
+        out_msg.Requestor   := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.writeMask   := in_msg.writeMask;
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: WriteFlush->ReqWB addr=%#x\n", address);
+      }
+    }
+  }
+
+
+  // Atomic{Return,NoReturn} → ReqOD
+  action(ta_translateAtomic, "ta",
+         desc="Translate Atomic → ReqOD and forward to Spandex Dir") {
+    peek(requestFromTCC_in, CPURequestMsg) {
+      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := SpandexRequestType:ReqOD;
+        out_msg.Requestor   := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.writeMask   := in_msg.writeMask;
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: Atomic->ReqOD addr=%#x return=%d\n",
+          address,
+          (in_msg.Type == CoherenceRequestType:AtomicReturn));
+      }
+    }
+  }
+
+
+  // ── Downward translation: SpandexResponseMsg → ResponseMsg ────────────
+  //
+  // All responses sent back to TCC must look exactly like what the MOESI NB
+  // would have sent.  Key fields TCC checks:
+  //   in_msg.Type         — NBSysResp or NBSysWBAck
+  //   in_msg.DataBlk      — data payload (for reads and atomics)
+  //   in_msg.CURequestor  — original TCP MachineID (echoed from TBE)
+  //   in_msg.isGLCSet     — echoed from TBE
+  //   in_msg.isSLCSet     — echoed from TBE
+  //   in_msg.instSeqNum   — echoed from TBE (for WBAck)
+  //   in_msg.State        — CoherenceState:Modified or :Shared
+
+  // SpxData → NBSysResp  (read response)
+  action(fdr_forwardDataResp, "fdr",
+         desc="Translate Spandex Data → NBSysResp and send to TCC") {
+    peek(responseFromDir_in, SpandexResponseMsg) {
+      enqueue(responseToTCC_out, ResponseMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := CoherenceResponseType:NBSysResp;
+        out_msg.Sender      := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(tbe.TCCRequestor);
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty       := false;
+        out_msg.State       := CoherenceState:Shared;
+        // Echo back pass-through fields from TBE so TCC can route to TCP
+        out_msg.CURequestor := tbe.CURequestor;
+        out_msg.isGLCSet    := tbe.isGLCSet;
+        out_msg.isSLCSet    := tbe.isSLCSet;
+        out_msg.instSeqNum  := tbe.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: SpxData->NBSysResp addr=%#x to TCC=%s for TCP=%s\n",
+          address, tbe.TCCRequestor, tbe.CURequestor);
+      }
+    }
+  }
+
+  // SpxAck → NBSysWBAck  (write-through ack)
+  action(fwa_forwardWriteAck, "fwa",
+         desc="Translate Spandex Ack → NBSysWBAck and send to TCC") {
+    enqueue(responseToTCC_out, ResponseMsg, tu_latency) {
+      out_msg.addr        := address;
+      out_msg.Type        := CoherenceResponseType:NBSysWBAck;
+      out_msg.Sender      := machineID;
+      out_msg.Destination.clear();
+      out_msg.Destination.add(tbe.TCCRequestor);
+      out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      out_msg.CURequestor := tbe.CURequestor;
+      out_msg.isGLCSet    := tbe.isGLCSet;
+      out_msg.isSLCSet    := tbe.isSLCSet;
+      out_msg.instSeqNum  := tbe.instSeqNum;
+      DPRINTF(RubySlicc,
+        "TU: SpxAck->NBSysWBAck addr=%#x to TCC=%s\n",
+        address, tbe.TCCRequestor);
+    }
+  }
+
+
+  // SpxWBAck → NBSysWBAck  (writeback ack)
+  action(fwba_forwardWBAck, "fwba",
+         desc="Translate Spandex WBAck → NBSysWBAck and send to TCC") {
+    enqueue(responseToTCC_out, ResponseMsg, tu_latency) {
+      out_msg.addr        := address;
+      out_msg.Type        := CoherenceResponseType:NBSysWBAck;
+      out_msg.Sender      := machineID;
+      out_msg.Destination.clear();
+      out_msg.Destination.add(tbe.TCCRequestor);
+      out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      out_msg.CURequestor := tbe.CURequestor;
+      out_msg.isGLCSet    := tbe.isGLCSet;
+      out_msg.isSLCSet    := tbe.isSLCSet;
+      out_msg.instSeqNum  := tbe.instSeqNum;
+      DPRINTF(RubySlicc,
+        "TU: SpxWBAck->NBSysWBAck addr=%#x to TCC=%s\n",
+        address, tbe.TCCRequestor);
+    }
+  }
+
+
+  // SpxAtomicResp → NBSysResp  (atomic with return data)
+  action(far_forwardAtomicResp, "far",
+         desc="Translate Spandex AtomicResp → NBSysResp and send to TCC") {
+    peek(responseFromDir_in, SpandexResponseMsg) {
+      enqueue(responseToTCC_out, ResponseMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := CoherenceResponseType:NBSysResp;
+        out_msg.Sender      := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(tbe.TCCRequestor);
+        out_msg.DataBlk     := in_msg.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        // Atomic responses come back in Modified state (TCC expects this
+        // for its bapdr path — forces bypass if SLC set)
+        out_msg.Dirty       := true;
+        out_msg.State       := CoherenceState:Modified;
+        out_msg.CURequestor := tbe.CURequestor;
+        out_msg.isGLCSet    := tbe.isGLCSet;
+        out_msg.isSLCSet    := tbe.isSLCSet;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: SpxAtomicResp->NBSysResp addr=%#x to TCC=%s\n",
+          address, tbe.TCCRequestor);
+      }
+    }
+  }
+
+  // SpxAtomicDone → NBSysWBAck  (atomic no-return done)
+  action(fad_forwardAtomicDone, "fad",
+         desc="Translate Spandex AtomicDone → NBSysWBAck and send to TCC") {
+    peek(responseFromDir_in, SpandexResponseMsg) {
+      enqueue(responseToTCC_out, ResponseMsg, tu_latency) {
+        out_msg.addr        := address;
+        out_msg.Type        := CoherenceResponseType:NBSysWBAck;
+        out_msg.Sender      := machineID;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(tbe.TCCRequestor);
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.CURequestor := tbe.CURequestor;
+        out_msg.isGLCSet    := tbe.isGLCSet;
+        out_msg.isSLCSet    := tbe.isSLCSet;
+        out_msg.instSeqNum  := in_msg.instSeqNum;
+        DPRINTF(RubySlicc,
+          "TU: SpxAtomicDone->NBSysWBAck addr=%#x to TCC=%s\n",
+          address, tbe.TCCRequestor);
+      }
+    }
+  }
+
+
+  // ── Queue management ──────────────────────────────────────────────────
+
+  action(p_popRequestQueue, "p",
+         desc="Pop TCC request queue (vnet 0)") {
+    requestFromTCC_in.dequeue(clockEdge());
+  }
+
+  action(pr_popResponseQueue, "pr",
+         desc="Pop Spandex Dir response queue (vnet 3)") {
+    responseFromDir_in.dequeue(clockEdge());
+  }
+
+  action(pu_popUnblockQueue, "pu",
+         desc="Pop TCC unblock queue (vnet 4) — absorbed silently") {
+    unblockFromTCC_in.dequeue(clockEdge());
+  }
+
+  action(w_wakeUp, "w",
+         desc="Wake up any requests stalled on this address") {
+    wakeUpAllBuffers(address);
+  }
+
+  action(z_stallAndWait, "z",
+         desc="Stall request — another request for this address is in-flight") {
+    stall_and_wait(requestFromTCC_in, address);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // TRANSITIONS
+  // ══════════════════════════════════════════════════════════════════════
+
+  // ── Read miss ─────────────────────────────────────────────────────────
+  // TCC sends RdBlk when it has a cache miss.
+  // TU allocates TBE, translates to ReqV, waits for SpxData.
+  transition(I, RdBlk, W) {
+    t_allocateTBE;
+    tr_translateRead;
+    p_popRequestQueue;
+  }
+
+  // Spandex Dir responds with data.
+  // TU synthesises NBSysResp and sends to TCC, then frees TBE.
+  transition(W, SpxData, I) {
+    fdr_forwardDataResp;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── Write-through (TCP store forwarded by TCC) ────────────────────────
+  // TCC sends WriteThrough (CURequestor = original TCP).
+  // TU translates to ReqWTD, waits for SpxAck.
+  transition(I, WriteThrough, W) {
+    t_allocateTBE;
+    twt_translateWriteThrough;
+    p_popRequestQueue;
+  }
+
+  transition(W, SpxAck, I) {
+    fwa_forwardWriteAck;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── TCC eviction writeback ────────────────────────────────────────────
+  // TCC sends WriteThrough with CURequestor == machineID (wb_writeBack).
+  // TU translates to ReqWB, waits for SpxWBAck.
+  transition(I, WriteBack, W) {
+    t_allocateTBE;
+    twb_translateWriteBack;
+    p_popRequestQueue;
+  }
+
+  transition(W, SpxWBAck, I) {
+    fwba_forwardWBAck;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── Flush writeback ───────────────────────────────────────────────────
+  // TCC sends WriteFlush (f_flush action).
+  // TU translates to ReqWB, waits for SpxWBAck.
+  transition(I, WriteFlush, W) {
+    t_allocateTBE;
+    tf_translateFlush;
+    p_popRequestQueue;
+  }
+
+  // SpxWBAck for flush also uses the fwba_forwardWBAck action.
+  // The W→I transition above handles this case since both writebacks and
+  // flushes wait in state W and receive SpxWBAck.
+
+  // ── Atomic (return value) ─────────────────────────────────────────────
+  // TCC sends AtomicReturn (at_atomicThrough action).
+  // TU translates to ReqOD, waits for SpxAtomicResp.
+  transition(I, AtomicReturn, W) {
+    t_allocateTBE;
+    ta_translateAtomic;
+    p_popRequestQueue;
+  }
+
+  transition(W, SpxAtomicResp, I) {
+    far_forwardAtomicResp;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── Atomic (no return value) ──────────────────────────────────────────
+  // TCC sends AtomicNoReturn (at_atomicThrough action).
+  // TU translates to ReqOD, waits for SpxAtomicDone.
+  transition(I, AtomicNoReturn, W) {
+    t_allocateTBE;
+    ta_translateAtomic;
+    p_popRequestQueue;
+  }
+
+
+  transition(W, SpxAtomicDone, I) {
+    fad_forwardAtomicDone;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── Unblock absorption ────────────────────────────────────────────────
+  // TCC sends UnblockMsg (vnet 4) after sdr_sendDataResponse / rb_bypassDone.
+  // The Spandex Dir does not need unblock messages — absorb silently.
+  // This can arrive in either state (TBE may have been released already).
+  transition({I, W}, Unblock) {
+    pu_popUnblockQueue;
+  }
+
+  // ── Stall concurrent requests ─────────────────────────────────────────
+  // If a new request arrives for an address already in state W
+  // (previous request still in-flight to Spandex Dir), stall it.
+  // wakeUpAllBuffers in the completion transitions will retry it.
+  transition(W, {RdBlk, WriteThrough, WriteBack,
+                 WriteFlush, AtomicReturn, AtomicNoReturn}) {
+    z_stallAndWait;
+  }
+}
