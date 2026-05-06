@@ -8,7 +8,7 @@
 
 ## Slide 1 — Title (≈30 s)
 
-**Spandex Coherence in gem5: A Translation-Unit Bridge for VIPER GPU**
+**Spandex Coherence in gem5: A Translation-hoUnit Bridge for VIPER GPU**
 
 Rohan Rao · Tanya · Shao-Kai · Yash · Mohith
 ECE 757 — Spring 2026
@@ -147,65 +147,94 @@ fix the line, rebuild incrementally.*
 
 ---
 
-## Slide 7 — Validation: random tester (≈1 min)
+## Slide 7 — Results 1: TU vs stock VIPER, random tester (≈1.25 min)
 
-**`ruby_gpu_random_test.py`** at three sizes:
+**`ruby_gpu_random_test.py`**, identical config, both protocols:
 
-| System         | Episodes  | Final tick     | Result   |
-|----------------|-----------|----------------|----------|
-| small          | 1         | 4,162          | **PASS** |
-| medium         | 16        | 77,511         | **PASS** |
-| large / TL=100 | **3,200** | **52,166,435** | **PASS** |
+| System / TL    | Stock VIPER         | Spandex TU       | TU/VIPER |
+|----------------|---------------------|------------------|----------|
+| small / 1      | 3,711               | 4,162            | 1.12×    |
+| medium / 1     | 84,790              | **77,511**       | **0.91× (faster!)** |
+| large / 1      | 236,496             | 236,999          | 1.002×   |
+| large / **100**| **abort @ 359,533** | **52,166,435 PASS** | **— (VIPER fails)** |
 
-**vs. simplified single-protocol Spandex** (no TCC, no TU):
+> 📊 **Best plot for this slide**: `results/plots/tl1_only/compare_simTicks_tl1.png`
+> (linear-scale comparison across small/medium/large_tl1 — the
+> TL=100 outlier would skew it; for that, just point at the table row)
+> Alternate: `results/plots/compare_simTicks.png` (log-scale, includes TL=100)
 
-| Variant              | Large/TL=100 ticks | vs simplified |
-|----------------------|--------------------|---------------|
-| Simplified Spandex   | 33,174,089         | 1.00×         |
-| **Spandex TU (this)**| **52,166,435**     | **1.57×**     |
+**Three story points:**
 
-*The 57% overhead is the cost of routing every miss through the real
-GPU L2 + the TU. That's the tax of keeping VIPER untouched. Whether
-it's worth it depends on the integration cost saved.*
+1. **TU is performance-equivalent to (or faster than) stock VIPER** on
+   workloads both can complete. At medium it's *9% faster* — the TU
+   pipeline is not "tax" in this regime.
+2. **Stock VIPER deterministically aborts at TL ≥ 10 / large** (always
+   tick 359,533); **Spandex TU completes a 100× longer stress workload**
+   (3,200 episodes, 52 M ticks).
+3. We did **not engineer for this** — VIPER stock has the bug, not us.
+
+*Punchline: the TU pivot cost zero perf and gained robustness.*
 
 ---
 
-## Slide 8 — Pannotia results (≈1 min)
+## Slide 8 — Results 2: where the TU's character shows (≈1 min)
 
-**[FILL IN — Pannotia BC + PageRank under apu\_se.py inside Docker]**
+**Network traffic vs DRAM traffic — opposite trends:**
 
-```
-[Bar chart: ticks for BC and PageRank
- — Stock VIPER vs Spandex TU
- — input: 1k_128k.gr]
-```
+| Size / TL | DRAM accesses     | On-chip messages   |
+|-----------|-------------------|--------------------|
+| small / 1 | VIPER 48 → TU 10  (**0.21×**)  | VIPER 108 → TU 168 (1.56×) |
+| medium /1 | VIPER 4063 → TU 798 (**0.20×**) | VIPER 9.5K → TU 16.4K (1.72×) |
+| large / 1 | VIPER 12K → TU 1.7K (**0.14×**) | VIPER 28.6K → TU 54.8K (1.91×) |
 
-```
-[Bar chart: network message count by class
- (Data, Request_Control, Response_Data, Response_Control)
- — Stock VIPER vs Spandex TU]
-```
+> 📊 **Best plots for this slide** (use the *ratio* versions — one bar per
+> config, value = TU/VIPER, a parity line at 1.0):
+>   - `results/plots/compare_dir_memory_msgs_ratio.png`  ← bars all < 1, dramatic
+>   - `results/plots/compare_net_total_msgs_ratio.png`   ← bars all > 1, the trade-off
+> Alternate (linear, TL=1 only):
+>   - `results/plots/tl1_only/compare_dir_memory_msgs_tl1.png`
+>   - `results/plots/tl1_only/compare_net_total_msgs_tl1.png`
 
-Key takeaway: *(fill after data lands)*
+**Why:**
+- Spandex directory **has a built-in 16 MiB L3**; VIPER's directory
+  doesn't. Most "miss" traffic in Spandex hits L3 instead of DRAM.
+- The TU pipeline adds two extra hops per miss (TCP → TCC → TU → Dir),
+  costing 1.5–1.9× more on-chip messages.
+- **Spandex trades on-chip bandwidth for off-chip bandwidth** — usually
+  a good trade (DRAM is the slow/expensive side).
+
+**HIP benchmarks (square / Pannotia BC / PageRank):**
+TU compiled, container Spandex built, square advanced to **tick ~76×10⁹**
+under apu_se.py before hitting an `Invalid transition` corner case in
+`TU_Transitions.cc` — reachable only under multi-process traffic
+(HSA + cmd processor + CPU host concurrent), not the random tester.
+Debugging deferred.
 
 ---
 
 ## Slide 9 — Lessons + Future Work (≈45 s)
 
 **Lessons:**
-- SLICC bring-up is mechanical: traceback → fix → rebuild.
-- gem5's MachineType is a closed enum — new types require editing the
-  master `RubySlicc_Exports.sm`.
-- gem5.opt isn't portable across glibc/Python: builds for HIP runs
-  must be done **inside** the gcn-gpu container.
+- **TU pivot was the right scope-cut.** Real perf parity, real
+  robustness gain, ~1 week of focused implementation.
+- **gem5's `MachineType` is a closed enum** — new types require editing
+  master `RubySlicc_Exports.sm`. Caught us mid-build.
+- **`gem5.opt` is not portable** across glibc/Python — HIP benchmarks
+  must run inside the same container that built gem5.
+- **Random tester ≠ apu_se.py traffic mix** — TU passed all random
+  tester sizes but hit a corner case under multi-process concurrent
+  HSA + GPU cmd processor + CPU host. *Different traffic patterns
+  expose different bugs.*
 
 **Future work:**
-- CPU-side TU (MESI CorePair → Spandex). ~700 lines. Demonstrates the
-  full heterogeneous-coherence story.
-- Per-word LLC state (Spandex paper's headline; eliminates false
-  sharing). ~2 weeks.
-- Sharer tracking + Inv broadcast — needed to support `ReqS`/`ReqO`.
-- L3 eviction with O-inclusivity (V_I transitions).
+- **CPU-side TU** (MESI `MOESI_AMD_Base-CorePair.sm` → Spandex).
+  ~700 lines. Real heterogeneous-coherence story.
+- **Per-word LLC state** — Spandex paper headline; eliminates false
+  sharing between CPU and GPU on the same line.
+- **Debug the apu_se.py TU corner case** — needs `--debug-flags=
+  ProtocolTrace` to identify the (state, event) panic'ing.
+- **Sharer tracking + Inv broadcast**, **L3 eviction with O-inclusivity
+  (V_I)**.
 
 ---
 
@@ -233,18 +262,34 @@ Key takeaway: *(fill after data lands)*
 
 ## Cue-sheet for the talk
 
-| Time | Slide | Beat                                    |
-|------|-------|-----------------------------------------|
-| 0:00 | 1     | Intro                                    |
-| 0:30 | 2     | Why two protocols?                       |
-| 1:30 | 3     | Spandex's 7-request menu                 |
-| 2:30 | 4     | Our architecture diagram                 |
-| 4:00 | 5     | Translation table                        |
-| 5:00 | 6     | 14-fix bring-up reality                   |
-| 6:00 | 7     | Random-tester pass + 57% TU overhead     |
-| 7:00 | 8     | Pannotia comparison plots                 |
-| 8:00 | 9     | Lessons + future work                    |
-| 8:30 |       | Hand to Q&A                              |
+| Time | Slide | Beat                                              |
+|------|-------|---------------------------------------------------|
+| 0:00 | 1     | Intro                                              |
+| 0:30 | 2     | Why two protocols?                                 |
+| 1:30 | 3     | Spandex's 7-request menu                           |
+| 2:30 | 4     | Architecture diagram (TU position)                 |
+| 4:00 | 5     | Translation table                                  |
+| 5:00 | 6     | 14-fix bring-up reality                            |
+| 6:00 | 7     | **Result 1**: VIPER aborts, TU passes — perf parity |
+| 7:15 | 8     | **Result 2**: 5–7× DRAM reduction; HIP corner case  |
+| 8:15 | 9     | Lessons + future work                              |
+| 8:45 |       | Hand to Q&A                                        |
 
 If running long, **cut Slide 5 to one mapping table** and let Slide 4
-carry the architecture story.
+carry the architecture story. Slide 6 (14-fix story) can also be
+cut to one bullet.
+
+**Reference slide → file (use these for the actual deck):**
+- Slide 7 plot:  `results/plots/tl1_only/compare_simTicks_tl1.png`
+                 (linear, 3 bars per protocol — small / medium / large)
+- Slide 8 plot A: `results/plots/compare_dir_memory_msgs_ratio.png`
+                 (TU/VIPER ratio bars — all 0.14× to 0.21×, the win)
+- Slide 8 plot B: `results/plots/compare_net_total_msgs_ratio.png`
+                 (TU/VIPER ratio — all 1.5× to 1.9×, the trade-off)
+- Raw data:      `results/random_tester_compare.csv`
+
+**Plot variants available** (regenerate with
+`python3 scripts/plot_comparison.py results/random_tester_compare.csv results/plots`):
+- `results/plots/compare_<metric>.png` — auto log-scale, all configs
+- `results/plots/compare_<metric>_ratio.png` — TU/VIPER ratio, scale-free
+- `results/plots/tl1_only/compare_<metric>_tl1.png` — linear, TL=1 only

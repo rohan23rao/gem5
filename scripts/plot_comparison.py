@@ -91,12 +91,25 @@ def parse_csv(csv_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def plot_metric(data: dict, metric_key: str, title: str, ylabel: str,
-                outdir: Path) -> None:
-    """data: {benchmark: {protocol: {metric: value}}}"""
+                outdir: Path, log_scale: bool = False,
+                file_suffix: str = "") -> None:
+    """data: {benchmark: {protocol: {metric: value}}}
+
+    log_scale=True forces a log-y axis. Otherwise auto: log if the data
+    spans more than 100× between min and max non-zero values.
+    """
     benches = sorted(data.keys())
     protocols = sorted({p for b in data.values() for p in b.keys()})
     if not benches:
         return
+
+    # Auto-detect log scale: if non-zero value range > 100×, use log.
+    all_vals = [v for b in data.values() for proto in b.values()
+                for k, v in proto.items() if k == metric_key
+                and v is not None and not np.isnan(v) and v > 0]
+    if not log_scale and all_vals:
+        if max(all_vals) / min(all_vals) > 100:
+            log_scale = True
 
     x = np.arange(len(benches))
     width = 0.8 / max(1, len(protocols))
@@ -106,33 +119,97 @@ def plot_metric(data: dict, metric_key: str, title: str, ylabel: str,
     for i, proto in enumerate(protocols):
         vals = [data[b].get(proto, {}).get(metric_key, np.nan)
                 for b in benches]
-        # Skip metric if no data
         if all(np.isnan(v) for v in vals):
             continue
         offset = (i - (len(protocols) - 1) / 2) * width
-        bars = ax.bar(x + offset, vals, width,
+        # For log scale, replace 0 with a tiny number so bars show
+        plot_vals = vals
+        if log_scale:
+            plot_vals = [v if (v is not None and not np.isnan(v) and v > 0)
+                         else float("nan") for v in vals]
+        bars = ax.bar(x + offset, plot_vals, width,
                       label=proto.upper(),
                       color=COLORS.get(proto, "#999"),
                       edgecolor="black", linewidth=0.5)
-        # Numeric labels above bars
         for bar, val in zip(bars, vals):
-            if not np.isnan(val):
-                ax.annotate(f"{val:,.3g}",
+            if val is not None and not np.isnan(val):
+                # Format compact for big numbers
+                if abs(val) >= 1e6:
+                    label = f"{val/1e6:.2f}M"
+                elif abs(val) >= 1e3:
+                    label = f"{val/1e3:.1f}K"
+                else:
+                    label = f"{val:,.3g}"
+                ax.annotate(label,
                             xy=(bar.get_x() + bar.get_width()/2, val),
                             xytext=(0, 3), textcoords="offset points",
                             ha="center", va="bottom", fontsize=8)
 
+    if log_scale:
+        ax.set_yscale("log")
+        title = f"{title} (log y)"
+
     ax.set_title(title)
-    ax.set_xlabel("Benchmark")
-    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Benchmark / config")
+    ax.set_ylabel(ylabel + (" — log" if log_scale else ""))
     ax.set_xticks(x)
     ax.set_xticklabels(benches, rotation=15, ha="right")
     ax.legend(loc="best")
-    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.grid(axis="y", alpha=0.3, linestyle="--",
+            which="both" if log_scale else "major")
     fig.tight_layout()
 
     outdir.mkdir(parents=True, exist_ok=True)
-    base = outdir / f"compare_{metric_key}"
+    base = outdir / f"compare_{metric_key}{file_suffix}"
+    fig.savefig(f"{base}.png", dpi=150)
+    fig.savefig(f"{base}.svg")
+    plt.close(fig)
+    print(f"  ✓ {base}.png + .svg")
+
+
+def plot_ratio(data: dict, metric_key: str, title: str, outdir: Path,
+               baseline: str = "viper", target: str = "spandex",
+               file_suffix: str = "_ratio") -> None:
+    """One bar per benchmark, value = target/baseline ratio. 1.0 baseline
+    line drawn for reference. Visualises 'TU/VIPER' independent of scale."""
+    benches = sorted(data.keys())
+    if not benches:
+        return
+    ratios = []
+    labels = []
+    for b in benches:
+        if baseline in data[b] and target in data[b]:
+            bv = data[b][baseline].get(metric_key)
+            tv = data[b][target].get(metric_key)
+            if bv is None or tv is None or bv == 0:
+                continue
+            ratios.append(tv / bv)
+            labels.append(b)
+    if not ratios:
+        return
+
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(5, 1.2 * len(labels)), 4.0))
+    bars = ax.bar(x, ratios, 0.6,
+                  color=[COLORS["spandex"] if r >= 1 else "#2ca02c" for r in ratios],
+                  edgecolor="black", linewidth=0.5)
+    ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--",
+               alpha=0.7, label="parity (VIPER baseline)")
+    for bar, r in zip(bars, ratios):
+        ax.annotate(f"{r:.3f}×",
+                    xy=(bar.get_x() + bar.get_width()/2, r),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=9)
+    ax.set_title(f"{title} — Spandex TU / VIPER ratio")
+    ax.set_xlabel("Config")
+    ax.set_ylabel(f"ratio (1.0 = parity)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.legend(loc="best")
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    outdir.mkdir(parents=True, exist_ok=True)
+    base = outdir / f"compare_{metric_key}{file_suffix}"
     fig.savefig(f"{base}.png", dpi=150)
     fig.savefig(f"{base}.svg")
     plt.close(fig)
@@ -186,7 +263,21 @@ def main(argv: list[str]) -> int:
 
     print(f"Plotting {len(data)} benchmark(s) → {args.outdir}/")
     for key, title, ylabel in METRICS:
+        # 1) Auto-scale comprehensive plot (auto picks log if range > 100×)
         plot_metric(data, key, title, ylabel, args.outdir)
+        # 2) Ratio plot (TU/VIPER), independent of scale
+        plot_ratio(data, key, title, args.outdir,
+                   baseline=args.baseline, target=args.target)
+
+    # 3) TL=1-only subset where everything is comparable on linear scale
+    tl1_data = {b: v for b, v in data.items() if "large" not in b or "tl1" in b}
+    # the 'small' and 'medium' rows are TL=1; 'large_tl1' is TL=1; drop 'large' (TL=100)
+    if tl1_data and tl1_data != data:
+        print(f"\nLinear-scale TL=1-only subset ({len(tl1_data)} configs):")
+        tl1_outdir = args.outdir / "tl1_only"
+        for key, title, ylabel in METRICS:
+            plot_metric(tl1_data, key, f"{title} (TL=1)", ylabel,
+                        tl1_outdir, log_scale=False, file_suffix="_tl1")
 
     print_speedup_table(data, args.baseline, args.target)
     return 0
