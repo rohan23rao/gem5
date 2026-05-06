@@ -23,16 +23,19 @@ GRAPH="/workspace/datasets/pannotia/1k_128k.gr"
 
 # Per-benchmark run options. Keep input small so timings are tractable.
 declare -A BENCH_BIN=(
+    [square]="square"
     [bc]="bc"
     [pagerank]="pagerank"
 )
 
 declare -A BENCH_DIR=(
+    [square]="/workspace/gpu_alex/square/bin"
     [bc]="/workspace/gem5-resources/src/gpu/pannotia/bc/bin"
     [pagerank]="/workspace/gem5-resources/src/gpu/pannotia/pagerank/bin"
 )
 
 declare -A BENCH_OPTS=(
+    [square]=""              # self-contained kernel; no input
     [bc]="$GRAPH 0"          # graph + source vertex
     [pagerank]="$GRAPH 1"    # graph + 1 = SPMV variant; 0 = baseline
 )
@@ -75,6 +78,9 @@ PROTOCOLS="${2:-spandex viper}"
 cd "$GEM5_DIR"
 
 for proto in $PROTOCOLS; do
+    if [[ "$WHICH" == "all" || "$WHICH" == "square" ]]; then
+        run_one square $proto
+    fi
     if [[ "$WHICH" == "all" || "$WHICH" == "bc" ]]; then
         run_one bc $proto
     fi
@@ -86,6 +92,7 @@ done
 echo
 echo "=== Stat summary ==="
 python3 scripts/extract_stats.py \
+    m5out_spandex_square m5out_viper_square \
     m5out_spandex_bc m5out_viper_bc \
     m5out_spandex_pagerank m5out_viper_pagerank \
     --csv results/comparison.csv 2>/dev/null || echo "  (some m5outs may be missing — re-run when builds land)"

@@ -28,6 +28,8 @@
 \def\viperRTmedium{TBD}
 \def\viperRTlarge{TBD}
 
+\def\sqSpxTicks{TBD}
+\def\sqViperTicks{TBD}
 \def\bcSpxTicks{TBD}
 \def\bcViperTicks{TBD}
 \def\prSpxTicks{TBD}
@@ -298,22 +300,29 @@ Table~\ref{tab:viper-cmp} compares Spandex TU against stock GPU\_VIPER
 on the random tester. \emph{[Discussion of relative performance fills
 in once VIPER baseline data lands.]}
 
-\subsection{Pannotia HIP benchmarks}
+\subsection{HIP benchmarks}
 
 \begin{table}[t]
 \centering
-\caption{Pannotia BC and PageRank, 1k\_128k.gr input.}
+\caption{HIP benchmarks: square (smoke test), Pannotia BC and PageRank
+(\texttt{1k\_128k.gr} input).}
 \label{tab:pannotia}
 \small
 \begin{tabular}{lrr}
 \toprule
 \textbf{Benchmark} & \textbf{Stock VIPER} & \textbf{Spandex TU} \\
 \midrule
+square   & \sqViperTicks & \sqSpxTicks \\
 BC       & \bcViperTicks & \bcSpxTicks \\
 PageRank & \prViperTicks & \prSpxTicks \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+We use \texttt{square} as a minimal smoke test (a self-contained
+square-the-numbers kernel exercising basic GPU load/store/atomic
+paths) plus the two Pannotia graph applications, which stress
+fine-grained atomics on shared vertex properties.
 
 \emph{[Discussion of network-message breakdown, miss rates, and
 sensitivity to the input graph fills in once benchmarks land.]}
