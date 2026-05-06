@@ -1,41 +1,25 @@
 /*
- * Copyright (c) 2020 Advanced Micro Devices, Inc.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from this
- * software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+* structure (GPUCoalescer, external = "yes") => define a structure called GPUCoalescer, implemented outside this file (C++)
+* void read/writeCallback(Addr, MachineType, DataBlock, Cycles, Cycles, Cycles, bool) => function called read/writecallback, 
+* when finishing read/write request, notify coalescer with this function 
+* Addr = address, DataBlock = returned cache line data, MachineType = data returned from which machine (TCP, TCC, dir)
+* Cycles = record the latency of request, bool = record additional status (hit/miss/bypass)
+* void evictionCallback(Addr) => notify coalescer that the address is evicted and not in the top-level cache
+* void recordCPRead/WriteCallBack(MachineID, MachineID) => record the read/write relations between 2 processors
+
+* VIPERCoalescer
+* void atomicCallback(Addr, MachineType, DataBlock) => when atomic operation finishes, notify the coalescer
+* void invTCPCallback(Addr) => notify coalescer when TCP line is invalidated
+* void writeCompleteCallback(Addr, uint64_t) => when write completes, notify coalescer with additional uint64 info
  */
 
-structure (GPUCoalescer, external = "yes") {
+structure(GPUCoalescer, external = "yes") {
   void readCallback(Addr, DataBlock);
-  void readCallback(Addr, MachineType, DataBlock, bool);
+  void readCallback(Addr, MachineType, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles);
   void readCallback(Addr, MachineType, DataBlock,
                     Cycles, Cycles, Cycles, bool);
-  void readCallback(Addr, MachineType, DataBlock,
-                    Cycles, Cycles, Cycles, bool, bool);
   void writeCallback(Addr, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock,
@@ -47,13 +31,13 @@ structure (GPUCoalescer, external = "yes") {
   void recordCPWriteCallBack(MachineID, MachineID);
 }
 
-structure (VIPERCoalescer, external = "yes") {
+structure(VIPERCoalescer, external = "yes") {
   void readCallback(Addr, DataBlock);
-  void readCallback(Addr, MachineType, DataBlock, bool);
+  void readCallback(Addr, MachineType, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles);
   void readCallback(Addr, MachineType, DataBlock,
                     Cycles, Cycles, Cycles, bool);
-  void readCallback(Addr, MachineType, DataBlock,
-                    Cycles, Cycles, Cycles, bool, bool);
   void writeCallback(Addr, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock,
@@ -62,7 +46,6 @@ structure (VIPERCoalescer, external = "yes") {
                      Cycles, Cycles, Cycles, bool);
   void atomicCallback(Addr, MachineType, DataBlock);
   void invTCPCallback(Addr);
-  void invTCCCallback(Addr);
   void writeCompleteCallback(Addr, uint64_t);
   void evictionCallback(Addr);
 }

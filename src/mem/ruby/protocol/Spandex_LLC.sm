@@ -1,0 +1,676 @@
+// Simplified Spandex LLC Controller
+//
+// Scope for VIPER GPU project:
+//   - VIPER TCC talks to a TU.
+//   - TU translates VIPER messages into Spandex ReqV / ReqWTD / ReqWB.
+//   - This LLC supports read, full-line write-through, and full-line writeback.
+//   - Atomic / ReqOD and partial writes are not supported.
+//   - ReqWTD / ReqWB update the LLC only; they do not write DRAM every time.
+//   - DRAM is updated only when a valid LLC line is evicted / replaced.
+
+machine(MachineType:Directory, "Simplified Spandex LLC Controller")
+ : DirectoryMemory * directory;
+   CacheMemory * L3cache;
+   Cycles response_latency := 2;
+   Cycles to_memory_controller_latency := 1;
+
+  // From TU below VIPER TCC
+  MessageBuffer * requestToDir, network="From", virtual_network="1",
+        vnet_type="request";
+
+  // To TU below VIPER TCC
+  MessageBuffer * responseFromDir, network="To", virtual_network="3",
+        vnet_type="response";
+
+  // Memory controller
+  MessageBuffer * requestToMemory;
+  MessageBuffer * responseFromMemory;
+{
+  // === STATES ===
+  
+  // 定義 LLC 每條 cache line 可能的 state, 預設 state 是 I
+  state_declaration(State, desc="Simplified Spandex LLC states",
+                    default="Directory_State_I") {
+    // Stable states
+    I, AccessPermission:Backing_Store,
+            desc="Invalid -- not in L3 cache";
+    V, AccessPermission:Read_Write,
+            desc="Valid -- data cached in L3 and up-to-date at LLC";
+
+    // Transient states
+
+    // 原本是 I, 收到 ReqV read miss, 已經送 memory read, 正在等 MemData 回來
+    I_V, AccessPermission:Busy,
+            desc="Invalid, waiting for memory data for read miss";
+
+    // 原本是 V, 收到 replacement signal, 已經送 memory writeback, 正在等 MemAck 回來
+    V_I, AccessPermission:Busy,
+            desc="Valid victim, memory writeback pending for replacement";
+  }
+
+  // === EVENTS ===
+  enumeration(Event, desc="Simplified Spandex LLC events") {
+    // Requests from TU
+    ReqV,       desc="Read request (ReqV)"; 
+
+    // TU issues write through
+    ReqWT,     desc="Full-line write-through";
+
+    // 上層 cache 要 evict / flush 一條 line，把資料寫回 LLC
+    ReqWB,      desc="Full-line writeback (ReqWB)";
+
+    // 當 L3cache 滿了，需要選 victim evict
+    Replacement, desc="L3 replacement / victim eviction";
+
+    // Memory controller responses
+    MemData,    desc="Data from main memory";     // Data response for read miss of LLC
+    MemAck,     desc="Writeback ack from memory"; // Ack for LLC writeback/ write through
+  }
+
+  // transition 需要讀 tag 和 data 的 request type, 用來記錄在 L3 cache 的 statistics
+  enumeration(RequestType,
+              desc="To communicate stats from transitions to recordStats") {
+    L3DataArrayRead,    desc="Read the data array";
+    L3DataArrayWrite,   desc="Write the data array";
+    L3TagArrayRead,     desc="Read the tag array";
+    L3TagArrayWrite,    desc="Write the tag array";
+  }
+
+  // === STRUCTURES ===
+
+  // 這份簡化版沒有真的用 directory 追蹤 sharer / owner
+  // coherence state 主要存在：CacheEntry.CacheState, TBE.TBEState
+  structure(Entry, desc="Directory entry", interface="AbstractCacheEntry",
+            main="false") {
+    State DirectoryState, desc="Directory state";
+  }
+
+  // LLC cache entry stores the LLC line data.
+  structure(CacheEntry, desc="LLC cache entry", interface="AbstractCacheEntry") {
+    State CacheState,    desc="Cache state"; 
+    DataBlock DataBlk,   desc="Cache line data";
+  }
+
+  // Transaction buffer entry for in-flight read misses
+  // 記錄還沒完成的 transaction
+  structure(TBE, desc="Transaction buffer entry") {
+    State TBEState,             desc="Transient state";
+    DataBlock DataBlk,          desc="Data for the block"; // memory 回來的資料會先存在 TBE, 之後再寫進 L3 cache
+    MachineID Requestor,        desc="Original requestor, normally the TU"; // read miss 時 request queue 會先 pop 掉，等 memory data 回來時，要知道要回給誰
+    uint64_t instSeqNum,        desc="Instruction sequence number"; // response 回去時會帶回去，讓 TU / TCC 可以對應原本 request
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<Directory_TBE>",
+           constructor="m_number_of_TBEs"; // 可以配置的 TBE 數量
+
+  Tick clockEdge();
+  Tick cyclesToTicks(Cycles c);
+
+  // 設定 / 清除目前 transition 使用的 TBE pointer 和 cache entry pointer，讓 action 可以直接用 tbe / cache_entry 來存取
+  void set_tbe(TBE a);
+  void unset_tbe();
+  void set_cache_entry(AbstractCacheEntry b);
+  void unset_cache_entry();
+
+  // 喚醒被 stall_and_wait 擋住的 message buffer
+  void wakeUpAllBuffers();
+  void wakeUpAllBuffers(Addr a);
+  void wakeUpBuffers(Addr a);
+
+  // 取得目前 cycle
+  Cycles curCycle();
+
+  // === HELPER FUNCTIONS ===
+
+  // 根據 address 回傳 directory entry
+  Entry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+
+    // 去 directory 裡查這個 address 的 entry
+    Entry dir_entry := static_cast(Entry, "pointer",
+                                   directory.lookup(addr));
+
+    // 如果查不到，就 allocate 一個新的 entry 給這個 address
+    if (is_invalid(dir_entry)) {
+      directory.allocate(addr, new Entry);
+
+      // 再查一次，取得剛剛 allocate 的 entry
+      dir_entry := static_cast(Entry, "pointer",
+                               directory.lookup(addr));
+    }
+    return dir_entry;
+  }
+
+  // 根據 address 查 L3 cache entry
+  CacheEntry getL3CacheEntry(Addr addr), return_by_pointer="yes" {
+    CacheEntry l3_entry := static_cast(CacheEntry, "pointer",
+                                       L3cache.lookup(addr));
+    return l3_entry;
+  }
+
+  // 根據 address 查 TBE entry
+  State getState(TBE tbe, CacheEntry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    }
+    if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+
+  // 設定某個 address 的 state，如果 TBE 存在就設定 TBE 的 state，否則設定 cache entry 的 state
+  void setState(TBE tbe, CacheEntry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+    if (is_valid(cache_entry)) {
+      cache_entry.CacheState := state;
+    }
+  }
+
+  // 根據 state 回傳對應的 access permission 給上層 TU
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if (is_valid(tbe)) {
+      return Directory_State_to_permission(tbe.TBEState);
+    }
+    CacheEntry l3_entry := getL3CacheEntry(addr);
+    if (is_valid(l3_entry)) {
+      return Directory_State_to_permission(l3_entry.CacheState);
+    }
+    return AccessPermission:Backing_Store;
+  }
+
+  // 設定 access permission 給上層 TU，主要是為了在 transition 裡面根據 state 變化來更新 permission
+  void setAccessPermission(CacheEntry cache_entry, Addr addr, State state) {
+
+    // 如果 cache entry 有效，就把 state 轉成 permission, ex: I -> Backing_Store, V -> Read_Write, I_V / V_I -> Busy
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(Directory_State_to_permission(state));
+    }
+  }
+
+  // 不是正常 timing protocol transition, used for debugging and functional accesses. 
+  // 直接讀 TBE, 再讀 L3 cache, 最後讀 memory.
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    if (is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      CacheEntry l3_entry := getL3CacheEntry(addr);
+      if (is_valid(l3_entry)) {
+        testAndRead(addr, l3_entry.DataBlk, pkt);
+      } else {
+        functionalMemoryRead(pkt);
+      }
+    }
+  }
+
+  // 直接寫 TBE, 再寫 L3 cache, 最後寫 memory, return 寫了幾筆資料
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+    TBE tbe := TBEs.lookup(addr);
+    if (is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    CacheEntry l3_entry := getL3CacheEntry(addr);
+    if (is_valid(l3_entry)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, l3_entry.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes +
+        functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  // record request type for statistics, used in transitions to tell L3 cache which array is being accessed
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:L3DataArrayRead) {
+        L3cache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:L3DataArrayWrite) {
+        L3cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:L3TagArrayRead) {
+        L3cache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:L3TagArrayWrite) {
+        L3cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    }
+  }
+
+  // 這個 function 檢查該 cycle cache array resource 能不能用
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:L3DataArrayRead) {
+      return L3cache.checkResourceAvailable(CacheResourceType:DataArray,
+                                            addr);
+    } else if (request_type == RequestType:L3DataArrayWrite) {
+      return L3cache.checkResourceAvailable(CacheResourceType:DataArray,
+                                            addr);
+    } else if (request_type == RequestType:L3TagArrayRead) {
+      return L3cache.checkResourceAvailable(CacheResourceType:TagArray,
+                                            addr);
+    } else if (request_type == RequestType:L3TagArrayWrite) {
+      return L3cache.checkResourceAvailable(CacheResourceType:TagArray,
+                                            addr);
+    } else {
+      error("Invalid RequestType in checkResourceAvailable");
+      return true;
+    }
+  }
+
+  // === OUT PORTS ===
+
+  out_port(responseNetwork_out, SpandexResponseMsg, responseFromDir); // LLC -> TU, 包含 read data 和 ack
+  out_port(memQueue_out, MemoryMsg, requestToMemory); // LLC -> memory controller, 包含 memory read 和 writeback
+
+  // === IN PORTS ===
+
+  // Memory responses have highest priority.
+  in_port(memQueue_in, MemoryMsg, responseFromMemory, rank=0) {
+    if (memQueue_in.isReady(clockEdge())) {
+
+      // 偷看 memory queue 最前面的 message，但還不 pop 掉，等 transition 裡面處理完再 pop
+      peek(memQueue_in, MemoryMsg) {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        CacheEntry cache_entry := getL3CacheEntry(in_msg.addr);
+
+        // We only expect memory responses for read misses (I_V) and replacements (V_I)
+        // Memory data sent back for read miss 
+        if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+          trigger(Event:MemData, in_msg.addr, cache_entry, tbe);
+
+        // Memory ack sent back for replacement writeback completion
+        } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+          trigger(Event:MemAck, in_msg.addr, cache_entry, tbe);
+
+        // other types of memory responses are not expected in this simplified model
+        } else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid memory response type");
+        }
+      }
+    }
+  }
+
+  // Requests from TU
+  in_port(requestToDir_in, SpandexRequestMsg, requestToDir, rank=1) {
+    
+    if (requestToDir_in.isReady(clockEdge())) {
+
+      // 偷看 request queue 最前面的 Spandex request, 決定要觸發哪種event, 但還不 pop 掉，等 transition 裡面處理完再 pop
+      peek(requestToDir_in, SpandexRequestMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        CacheEntry cache_entry := getL3CacheEntry(in_msg.addr);
+
+        // 如果 request 是 read request
+        if (in_msg.Type == SpandexRequestType:ReqV) {
+
+          // 如果 L3 已經有這條 line，或是 L3 有空間可以 allocate，就直接觸發 read event
+          if (is_valid(cache_entry) || L3cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:ReqV, in_msg.addr, cache_entry, tbe);
+
+          // 否則 L3 cache 已經滿了，觸發 replacement event 來選 victim line evict
+          } else {
+            Addr victim := L3cache.cacheProbe(in_msg.addr);
+            trigger(Event:Replacement, victim, getL3CacheEntry(victim),
+                    TBEs.lookup(victim));
+          }
+
+        // 如果 request 是 full-line write-through
+        } else if (in_msg.Type == SpandexRequestType:ReqWT) {
+
+          // 如果 L3 有這條 line，或有空間 allocate，就直接觸發 write-through event
+          if (is_valid(cache_entry) || L3cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:ReqWT, in_msg.addr, cache_entry, tbe);
+
+          // 否則 L3 cache 已經滿了，觸發 replacement event 來選 victim line evict
+          } else {
+            Addr victim := L3cache.cacheProbe(in_msg.addr);
+            trigger(Event:Replacement, victim, getL3CacheEntry(victim),
+                    TBEs.lookup(victim));
+          }
+
+        // 如果 request 是 full-line write-back
+        } else if (in_msg.Type == SpandexRequestType:ReqWB) {
+
+          // 如果 L3 有這條 line，或有空間 allocate，就直接觸發 write-back event
+          if (is_valid(cache_entry) || L3cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:ReqWB, in_msg.addr, cache_entry, tbe);
+
+          // 否則 L3 cache 已經滿了，觸發 replacement event 來選 victim line evict
+          } else {
+            Addr victim := L3cache.cacheProbe(in_msg.addr);
+            trigger(Event:Replacement, victim, getL3CacheEntry(victim),
+                    TBEs.lookup(victim));
+          }
+        
+        // 其他類型的 request 在這個簡化模型裡不支援，直接報錯
+        } else if (in_msg.Type == SpandexRequestType:ReqOD) {
+          error("ReqOD / atomic is not supported in simplified spandex_llc.sm");
+        } else {
+          error("Unexpected request type to simplified Spandex LLC");
+        }
+      }
+    }
+  }
+
+  // === ACTIONS ===
+
+  // --- TBE management ---
+
+  // allocate TBE, 主要在 read miss 的時候用，先 allocate TBE 存 memory 回來的資料
+  action(atbe_allocateTBE, "atbe", desc="Allocate TBE") {
+    check_allocate(TBEs);
+    TBEs.allocate(address);
+    set_tbe(TBEs.lookup(address)); // 把剛 allocate 的 TBE 設成目前 transition 使用的 TBE
+  }
+
+  // 釋放 TBE, 主要在 read miss 完成，memory data 已經寫進 L3 cache 且回應給 TU 之後用，釋放 TBE 並清除 pointer
+  action(dtbe_deallocateTBE, "dtbe", desc="Deallocate TBE") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  // 把 requestor 存到 TBE, 主要在 read miss 的時候用，
+  // 因為 read miss 會先把 request queue pop 掉，等 memory data 回來時要知道要回給誰，所以先把 requestor 存在 TBE 裡
+  action(sr_saveRequestor, "sr", desc="Save requestor in TBE") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      tbe.Requestor := in_msg.Requestor;
+      tbe.instSeqNum := in_msg.instSeqNum;
+    }
+  }
+
+  // --- L3 cache management ---
+
+  // allocate L3 cache entry
+  action(al3_allocateL3, "al3", desc="Allocate L3 cache block") {
+
+    // 如果目前沒有 L3 entry, 就 allocate 一個新的 entry 給這個 address, 並把 pointer 設成目前 transition 使用的 cache_entry
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L3cache.allocate(address, new CacheEntry));
+    }
+  }
+
+  // deallocate L3 block
+  action(dl3_deallocateL3, "dl3", desc="Deallocate L3 cache block") {
+
+    // 如果 cache entry 有效，就從 L3cache 移除這個 address 的 entry, 並把 pointer 清除
+    if (is_valid(cache_entry)) {
+      L3cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  // --- Memory actions ---
+
+  // 送 memory read
+  action(qmr_queueMemoryRead, "qmr", desc="Queue memory read") {
+    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_READ;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      out_msg.Len := 0;
+    }
+  }
+
+  // 送 memory writeback
+  // Only used by L3 replacement / eviction, not by every ReqWT/ReqWB.
+  action(qmw_queueMemoryWrite, "qmw", desc="Queue memory writeback for L3 eviction") {
+    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      assert(is_valid(cache_entry));
+      out_msg.DataBlk := cache_entry.DataBlk;
+    }
+  }
+
+  // 把 memory 回來的 data 寫進 TBE
+  action(wdtbe_writeMemDataToTBE, "wdtbe", desc="Write memory data to TBE") {
+    peek(memQueue_in, MemoryMsg) {
+      tbe.DataBlk := in_msg.DataBlk;
+    }
+  }
+
+  // --- Data writing ---
+
+  // 把 TBE data 寫進 L3, 發生在 read miss memory data 回來後
+  action(wl3_writeDataToL3, "wl3", desc="Write TBE data to L3") {
+    assert(is_valid(cache_entry));
+    cache_entry.DataBlk := tbe.DataBlk;
+  }
+
+  // 把 request 帶的 full-line data 寫進 L3 (replace old data in the line)
+  action(wl3r_writeReqDataToL3, "wl3r", desc="Write full request data to L3") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      assert(is_valid(cache_entry));
+      cache_entry.DataBlk := in_msg.DataBlk; // 把 request 的 data 整條覆蓋到 L3 cache line
+    }
+  }
+
+  // --- Sending responses ---
+
+  // 從 L3 回 data 給 requestor (TU), 通常用在 read hit
+  action(sd_sendDataFromL3, "sd", desc="Send data from L3 to requestor") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+
+      // 送一個 response message 到 TU
+      enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := SpandexResponseType:Data;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        assert(is_valid(cache_entry)); // 確認 L3 entry 有效
+        out_msg.DataBlk := cache_entry.DataBlk; // 把 L3 的 data 放進 response
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    }
+  }
+
+  // 從 TBE 回 data 給 requestor (TU), 通常用在 read miss memory data 回來後
+  action(sdt_sendDataFromTBE, "sdt",
+         desc="Send data from TBE to requestor") {
+    enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := SpandexResponseType:Data;
+      out_msg.Sender := machineID;
+      // destination 是 TBE 裡保存的 requestor
+      // 因為原本 request 已經被 pop 了，所以不能再 peek request queue
+      out_msg.Destination.add(tbe.Requestor);
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.instSeqNum := tbe.instSeqNum;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  // 回 write-through ack
+  action(sa_sendAck, "sa", desc="Send write-through ack to requestor") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+
+      // 送 response 到 TU
+      enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := SpandexResponseType:Ack;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+  // 回 writeback ack
+  action(swba_sendWBAck, "swba", desc="Send writeback ack to requestor") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := SpandexResponseType:WBAck;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+        out_msg.MessageSize := MessageSizeType:Response_Control; // WBAck 不帶 data，所以是 control response
+      }
+    }
+  }
+
+  // --- Queue / wakeup management ---
+
+  // pop request queue
+  action(prq_popRequestQueue, "prq", desc="Pop request queue") {
+    // 把 requestToDir_in 最前面的 request 移除
+    requestToDir_in.dequeue(clockEdge());
+  }
+
+  // stall request
+  action(z_stallAndWaitRequest, "z", desc="Stall and wait on request address") {
+    //把目前 request queue 依照目前 address stall 住, 通常用在該 address 正在 transient state 時
+    stall_and_wait(requestToDir_in, address);
+  }
+
+  // 它用在 replacement path, 因為 transition address 是 victim address，
+  // 但目前 request queue front 是原本 incoming request address, 所以要 stall 的不是 victim，而是 incoming request
+  action(zir_stallIncomingRequest, "zir", desc="Stall current incoming request while victim is evicted") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      Addr req_addr := in_msg.addr;
+      stall_and_wait(requestToDir_in, req_addr);
+    }
+  }
+
+  // pop memory queue
+  action(pmq_popMemQueue, "pmq", desc="Pop memory queue") {
+    // 把 memory response queue front 移除
+    memQueue_in.dequeue(clockEdge());
+  }
+
+  // 喚醒某個 address 的 stalled requests
+  // 例如 read miss 回來後，喚醒同一 address 的其他 request
+  action(wad_wakeUpAllDependents, "wad", desc="Wake up stalled requests for this address") {
+    wakeUpAllBuffers(address);
+  }
+
+  // 喚醒所有 stalled buffers
+  // replacement 完成後直接喚醒全部，讓原本因為 L3 滿而被 stall 的 request retry
+  // 因為 replacement transition 的 address 是 victim B，但真正被 stall 的 request 是 incoming A；
+  // MemAck 回來時只知道 B，不知道 A，所以用 wakeUpAllBuffers() 保守地叫醒所有 stalled requests，讓 A retry
+  action(wa_wakeUpAllBuffers, "wa", desc="Wake up all stalled buffers after replacement") {
+    wakeUpAllBuffers();
+  }
+
+  // === TRANSITIONS ===
+
+  // ============ FROM STATE I (Invalid / not in L3) ============
+
+  // Read miss -- fetch from memory. The requestor is the TU.
+  transition(I, ReqV, I_V) {L3TagArrayRead} {
+    atbe_allocateTBE;    // allocate TBE，因為這個 request 不能馬上完成，要等 memory data
+    sr_saveRequestor;    // 把 requestor 和 instSeqNum 存到 TBE
+    qmr_queueMemoryRead; // 送 memory read 到 DRAM / memory controller
+    prq_popRequestQueue; // 把原本 request 從 request queue pop 掉, 因為相關資訊已經存在 TBE
+  }
+
+  // Full-line write-through to a line not in L3 -- allocate, write LLC, ack (not write to DRAM)
+  transition(I, ReqWT, V) {L3TagArrayRead, L3TagArrayWrite, L3DataArrayWrite} {
+    al3_allocateL3; // allocate L3 cache entry
+    wl3r_writeReqDataToL3; // 把 request 裡的 full-line data 寫進 L3
+    sa_sendAck; // 回 Ack 給 TU
+    prq_popRequestQueue; // pop request queue
+  }
+
+  // Full-line writeback to a line not in L3 -- allocate, write LLC, ack.
+  // This does not write DRAM immediately.
+  transition(I, ReqWB, V) {L3TagArrayRead, L3TagArrayWrite, L3DataArrayWrite} {
+    al3_allocateL3;
+    wl3r_writeReqDataToL3;
+    swba_sendWBAck;
+    prq_popRequestQueue;
+  }
+
+  // Memory ack in invalid state -- defensive dequeue.
+  // 如果在 I state 收到 memory ack，就把 memory queue pop 掉
+  transition(I, MemAck) {
+    pmq_popMemQueue;
+  }
+
+  // ============ FROM STATE V (Valid in L3) ============
+
+  // Read hit -- serve from L3.
+  transition(V, ReqV) {L3TagArrayRead, L3DataArrayRead} {
+    sd_sendDataFromL3; // 從 L3 把 data 回給 TU
+    prq_popRequestQueue;
+  }
+
+  // Full-line write-through hit -- update L3 only, ack.
+  transition(V, ReqWT) {L3TagArrayRead, L3DataArrayWrite} {
+    wl3r_writeReqDataToL3; // 用 request data 覆蓋 L3 data
+    sa_sendAck;
+    prq_popRequestQueue;
+  }
+
+  // Full-line writeback hit -- update L3 only, WBAck.
+  transition(V, ReqWB) {L3TagArrayRead, L3DataArrayWrite} {
+    wl3r_writeReqDataToL3;
+    swba_sendWBAck;
+    prq_popRequestQueue;
+  }
+
+  // L3 replacement -- write victim line back to memory, then deallocate it.
+  // This path is only for eviction, not every ReqWT/ReqWB.
+  transition(V, Replacement, V_I) {L3TagArrayRead, L3DataArrayRead} {
+    qmw_queueMemoryWrite; // 把 victim line 的 data 寫回 DRAM
+    zir_stallIncomingRequest;
+  }
+
+  // Defensive memory ack in stable V.
+  // 這是 defensive transition，正常不太應該發生
+  transition(V, MemAck) {
+    pmq_popMemQueue;
+  }
+
+  // ============ TRANSIENT STATES ============
+
+  // Memory data arrived for a read miss. Fill L3 and respond to TU.
+  transition(I_V, MemData, V) {L3TagArrayWrite, L3DataArrayWrite} {
+    al3_allocateL3;
+    wdtbe_writeMemDataToTBE; // 把 memory response data 寫進 TBE
+    wl3_writeDataToL3; // 把 TBE data 寫進 L3
+    sdt_sendDataFromTBE; // 從 TBE 把 data 回給原本 requestor (TU), 因為原本 request 已經 pop 掉，所以用 TBE 裡保存的 requestor
+    dtbe_deallocateTBE; // transaction 完成，釋放 TBE
+    wad_wakeUpAllDependents; // 喚醒同 address 被 stall 的其他 requests
+    pmq_popMemQueue;
+  }
+
+  // victim writeback 到 DRAM 完成
+  transition(V_I, MemAck, I) {L3TagArrayWrite} {
+    dl3_deallocateL3; // deallocate victim line
+    wa_wakeUpAllBuffers; // 喚醒所有 stalled buffers
+    pmq_popMemQueue;
+  }
+
+  // Stall requests to lines with pending memory operations.
+  transition({I_V, V_I}, {ReqV, ReqWT, ReqWB, Replacement}) {
+    z_stallAndWaitRequest;
+  }
+
+  // Defensive memory data during replacement -- not expected.
+  // 如果 replacement pending 時收到 MemData，直接 pop, 正常不應該發生，因為 V_I 等的是 MemAck
+  transition(V_I, MemData) {
+    pmq_popMemQueue;
+  }
+
+  // Defensive memory ack during read miss -- not expected.
+  // 如果 read miss pending 時收到 MemAck，直接 pop。
+  // 正常不應該發生，因為 I_V 等的是 MemData
+  transition(I_V, MemAck) {
+    pmq_popMemQueue;
+  }
+}

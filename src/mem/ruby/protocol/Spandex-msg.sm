@@ -66,22 +66,3 @@ structure(SpandexResponseMsg, desc="Spandex response message",
     }
 }
 
-// External C++ class declarations so SLICC can call methods on these objects
-structure(VIPERCoalescer, external="yes") {
-    void readCallback(Addr, DataBlock);
-    void readCallback(Addr, MachineType, DataBlock, bool);
-    void readCallback(Addr, MachineType, DataBlock,
-                      Cycles, Cycles, Cycles, bool);
-    void readCallback(Addr, MachineType, DataBlock,
-                      Cycles, Cycles, Cycles, bool, bool);
-    void writeCallback(Addr, DataBlock);
-    void writeCallback(Addr, MachineType, DataBlock);
-    void writeCallback(Addr, MachineType, DataBlock,
-                       Cycles, Cycles, Cycles);
-    void writeCallback(Addr, MachineType, DataBlock,
-                       Cycles, Cycles, Cycles, bool);
-    void atomicCallback(Addr, MachineType, DataBlock);
-    void invTCPCallback(Addr);
-    void writeCompleteCallback(Addr, uint64_t);
-    void evictionCallback(Addr);
-}

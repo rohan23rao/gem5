@@ -234,7 +234,7 @@ machine(MachineType:TCC, "TCC Cache")
     } else if (request_type == RequestType:TagArrayWrite) {
         L2cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
     } else if (request_type == RequestType:AtomicALUOperation) {
-        L2cache.recordRequestType(CacheRequestType:AtomicALUOperation, addr);
+        L2cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
     }
   }
 
@@ -248,7 +248,7 @@ machine(MachineType:TCC, "TCC Cache")
     } else if (request_type == RequestType:TagArrayWrite) {
       return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
     } else if (request_type == RequestType:AtomicALUOperation) {
-      return L2cache.checkResourceAvailable(CacheResourceType:AtomicALUArray, addr);
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
     } else {
       error("Invalid RequestType type in checkResourceAvailable");
       return true;
@@ -388,33 +388,8 @@ machine(MachineType:TCC, "TCC Cache")
             } else {
                 trigger(Event:WrVicBlk, in_msg.addr, cache_entry, tbe);
             }
-        } else if (in_msg.Type == CoherenceRequestType:Atomic ||
-                   in_msg.Type == CoherenceRequestType:AtomicReturn ||
-                   in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
-	  /*
-	    If there are pending requests for this line already and those
-	    requests are not atomics, because we can't easily differentiate
-	    between different request types on return and because decrementing
-	    the atomic count assumes all returned requests in the A state are
-	    atomics, we will need to put this atomic to sleep and wake it up
-	    when the loads return.
-	   */
-	  if (is_valid(tbe) && (tbe.numPending > 0) &&
-	        (tbe.numPendingDirectoryAtomics == 0)) {
-            trigger(Event:AtomicWait, in_msg.addr, cache_entry, tbe);
-          } else {
-            // If the request is system-level, if the address isn't in the cache,
-            // or if this cache is write-through, then send the request to the
-            // directory. Since non-SLC atomics won't be performed by the directory,
-            // TCC will perform the atomic on the return path on Event:Data.
-            // The action will invalidate the cache line if SLC is set and the address is
-            // in the cache.
-            if(in_msg.isSLCSet || !WB) {
-              trigger(Event:AtomicPassOn, in_msg.addr, cache_entry, tbe);
-            } else {
-              trigger(Event:Atomic, in_msg.addr, cache_entry, tbe);
-            }
-          }
+        } else if (in_msg.Type == CoherenceRequestType:Atomic) {
+          error("TCC: atomic request is unsupported in this Spandex LLC bring-up");
         } else if (in_msg.Type == CoherenceRequestType:RdBlk) {
           if (in_msg.isSLCSet) {
             // If SLC bit is set, the request needs to go directly to memory.
@@ -425,8 +400,6 @@ machine(MachineType:TCC, "TCC Cache")
           }
         } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
             trigger(Event:Flush, in_msg.addr, cache_entry, tbe);
-        } else if (in_msg.Type == CoherenceRequestType:InvCache) {
-            trigger(Event:InvCache, in_msg.addr, cache_entry, tbe);
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg);
           error("Unexpected Response Message to Core");
@@ -447,7 +420,7 @@ machine(MachineType:TCC, "TCC Cache")
     peek(coreRequestNetwork_in, CPURequestMsg) {
       enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
         out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:InvL2Resp;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
         out_msg.MessageSize := MessageSizeType:Response_Control;
@@ -610,7 +583,7 @@ machine(MachineType:TCC, "TCC Cache")
 
   action(ar_sendAtomicResponse, "ar", desc="send Atomic Ack") {
     peek(coreRequestNetwork_in, CPURequestMsg) {
-        enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency, true) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:TDSysResp;
           out_msg.Destination.clear();
@@ -689,9 +662,7 @@ machine(MachineType:TCC, "TCC Cache")
     if (coreRequestNetwork_in.isReady(clockEdge())) {
       peek(coreRequestNetwork_in, CPURequestMsg) {
         if(in_msg.Type == CoherenceRequestType:RdBlk ||
-           in_msg.Type == CoherenceRequestType:Atomic ||
-           in_msg.Type == CoherenceRequestType:AtomicReturn ||
-           in_msg.Type == CoherenceRequestType:AtomicNoReturn){
+           in_msg.Type == CoherenceRequestType:Atomic){
           tbe.Destination.add(in_msg.Requestor);
         }
         /*
@@ -706,14 +677,12 @@ machine(MachineType:TCC, "TCC Cache")
          */
         tbe.isGLCSet := in_msg.isGLCSet;
         tbe.isSLCSet := in_msg.isSLCSet;
-        if(in_msg.Type == CoherenceRequestType:Atomic ||
-           in_msg.Type == CoherenceRequestType:AtomicReturn ||
-           in_msg.Type == CoherenceRequestType:AtomicNoReturn){
+        if(in_msg.Type == CoherenceRequestType:Atomic){
           tbe.atomicWriteMask.clear();
           tbe.atomicWriteMask.orMask(in_msg.writeMask);
         }
-        tbe.atomicDataReturn := in_msg.Type == CoherenceRequestType:AtomicReturn;
-        tbe.atomicDataNoReturn := in_msg.Type == CoherenceRequestType:AtomicNoReturn;
+        tbe.atomicDataReturn := false;
+        tbe.atomicDataNoReturn := false;
       }
     }
   }
@@ -933,20 +902,7 @@ machine(MachineType:TCC, "TCC Cache")
   }
 
   action(pa_performAtomic, "pa", desc="Perform atomic") {
-    if (is_valid(tbe) && tbe.atomicDataReturn) {
-       cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, false);
-    } else if (is_valid(tbe) && tbe.atomicDataNoReturn) {
-       cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, true);
-    } else {
-      peek(coreRequestNetwork_in, CPURequestMsg) {
-        if (in_msg.Type == CoherenceRequestType:AtomicReturn) {
-           cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, false);
-        } else {
-          assert(in_msg.Type == CoherenceRequestType:AtomicNoReturn);
-          cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, true);
-        }
-      }
-    }
+    error("TCC: atomic operation is unsupported in this Spandex LLC bring-up");
   }
 
   // END ACTIONS
@@ -1406,3 +1362,4 @@ machine(MachineType:TCC, "TCC Cache")
     p_popRequestQueue;
    }
 }
+

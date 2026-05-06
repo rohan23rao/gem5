@@ -1,8 +1,20 @@
 // Spandex DMA Controller
 //
-// Minimal DMA controller that translates DMA read/write operations to
-// Spandex ReqV / ReqWTD messages. Reuses the same vnets (1 for requests,
-// 3 for responses) as the GPU TCP/SQC controllers.
+// Minimal DMA controller for the Spandex + GPU VIPER_TCC/TU project.
+// DMA requests are not on the main GPU TCP -> TCC -> TU path; they are used
+// by the GPU runtime/command/DMA devices and go directly to the Spandex LLC
+// directory using the same Spandex message format.
+//
+// Project simplification:
+// - DMA read  : Sequencer LD -> Spandex ReqV
+// - DMA write : Sequencer ST -> Spandex ReqWT with DataBlk + writeMask
+// - Do not use ReqWTD, because the simplified Spandex LLC/TU bring-up uses
+//   ReqWT as the write-through-with-data request type.
+// - No atomic/RMW support here.
+//
+// Network usage:
+// - vnet 1: DMA -> Spandex LLC/Directory requests
+// - vnet 3: Spandex LLC/Directory -> DMA responses
 
 machine(MachineType:DMA, "Spandex DMA Controller")
     : DMASequencer * dma_sequencer;
@@ -77,9 +89,9 @@ machine(MachineType:DMA, "Spandex DMA Controller")
     error("DMA does not support functional write.");
   }
 
-  out_port(requestToDir_out, SpandexRequestMsg, requestToDir, desc="...");
+  out_port(requestToDir_out, SpandexRequestMsg, requestToDir, desc="DMA requests to Spandex LLC/Directory");
 
-  in_port(dmaRequestQueue_in, SequencerMsg, mandatoryQueue, desc="...") {
+  in_port(dmaRequestQueue_in, SequencerMsg, mandatoryQueue, desc="Incoming DMA sequencer requests") {
     if (dmaRequestQueue_in.isReady(clockEdge())) {
       peek(dmaRequestQueue_in, SequencerMsg) {
         if (in_msg.Type == SequencerRequestType:LD) {
@@ -89,13 +101,13 @@ machine(MachineType:DMA, "Spandex DMA Controller")
           trigger(Event:WriteRequest, in_msg.LineAddress,
                   TBEs[in_msg.LineAddress]);
         } else {
-          error("Invalid DMA request type");
+          error("Invalid/unsupported DMA request type: only LD/ST are supported in this Spandex DMA controller");
         }
       }
     }
   }
 
-  in_port(dmaResponseQueue_in, SpandexResponseMsg, responseFromDir, desc="...") {
+  in_port(dmaResponseQueue_in, SpandexResponseMsg, responseFromDir, desc="Responses from Spandex LLC/Directory") {
     if (dmaResponseQueue_in.isReady(clockEdge())) {
       peek(dmaResponseQueue_in, SpandexResponseMsg) {
         if (in_msg.Type == SpandexResponseType:Data) {
@@ -103,7 +115,7 @@ machine(MachineType:DMA, "Spandex DMA Controller")
         } else if (in_msg.Type == SpandexResponseType:Ack) {
           trigger(Event:Ack, in_msg.addr, TBEs[in_msg.addr]);
         } else {
-          error("Invalid DMA response type");
+          error("Invalid/unsupported DMA response type: expected Data or Ack");
         }
       }
     }
@@ -122,11 +134,11 @@ machine(MachineType:DMA, "Spandex DMA Controller")
     }
   }
 
-  action(sw_sendWriteRequest, "\s", desc="Send a ReqWTD to directory") {
+  action(sw_sendWriteRequest, "\s", desc="Send a ReqWT with data to directory") {
     peek(dmaRequestQueue_in, SequencerMsg) {
       enqueue(requestToDir_out, SpandexRequestMsg, request_latency) {
         out_msg.addr := in_msg.LineAddress;
-        out_msg.Type := SpandexRequestType:ReqWTD;
+        out_msg.Type := SpandexRequestType:ReqWT;
         out_msg.Requestor := machineID;
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.writeMask.setMask(

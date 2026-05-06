@@ -21,18 +21,18 @@
 *
 * Upward (CPURequestMsg -> SpandexRequestMsg):
 *  RdBlk                ->  ReqV
-*  WriteThrough         ->  ReqWTD  (carries DataBlk + writeMask)
+*  WriteThrough         ->  ReqWT   (carries DataBlk + writeMask)
 *  WriteFlush           ->  ReqWB   (carries DataBlk + writeMask)
 *  wb_writeBack         ->  ReqWB   (TCC eviction writback, no CURequestor)
-*  AtomicReturn         ->  ReqOD   (atomic with return value)
-*  AtomicNoReturn       ->  ReqOD   (atomic without return value)
+*  AtomicReturn         ->  unsupported in this initial implementation
+*  AtomicNoReturn       ->  unsupported in this initial implementation
 *
 * Downward (SpandexResponseMsg -> SpandexRequestMsg)
 *  Data                        ->  NBSysResp  (carries DataBlk + CURequestor)
 *  Ack                         ->  NBSysWBAck (write-through ack)
 *  WBAck                       ->  NBSysWBAck (writeback ack)
-*  AtomicResp                  ->  NBSysResp  (carries DataBlk + CURequestor)
-*  AtomicDone                  ->  NBSysWBAck (atomic no-return ack)
+*  AtomicResp                  ->  unsupported / should not be generated
+*  AtomicDone                  ->  unsupported / should not be generated
 *
 * --- CURequestor pass-through -----------------------------------------------------------------
 *  The TCC sets CURequestor = original TCP when it calls rd_requestData /
@@ -233,10 +233,9 @@ machine(MachineType:TU, "Spandex Translation Unit")
           trigger(Event:SpxAck, in_msg.addr, tbe);
         } else if (in_msg.Type == SpandexResponseType:WBAck) {
           trigger(Event:SpxWBAck, in_msg.addr, tbe);
-        } else if (in_msg.Type == SpandexResponseType:AtomicResp) {
-          trigger(Event:SpxAtomicResp, in_msg.addr, tbe);
-        } else if (in_msg.Type == SpandexResponseType:AtomicDone) {
-          trigger(Event:SpxAtomicDone, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:AtomicResp ||
+                   in_msg.Type == SpandexResponseType:AtomicDone) {
+          error("TU: atomic response received, but atomic is unsupported");
         } else {
           error("TU: unexpected SpandexResponseMsg type from Spandex Dir");
         }
@@ -263,10 +262,9 @@ machine(MachineType:TU, "Spandex Translation Unit")
           }
         } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
           trigger(Event:WriteFlush, in_msg.addr, tbe);
-        } else if (in_msg.Type == CoherenceRequestType:AtomicReturn) {
-          trigger(Event:AtomicReturn, in_msg.addr, tbe);
-        } else if (in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
-          trigger(Event:AtomicNoReturn, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:AtomicReturn ||
+                   in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
+          error("TU: atomic request from TCC is unsupported in this Spandex LLC bring-up");
         } else {
           DPRINTF(RubySlicc, "TU: unexpected CPURequestMsg type: %s\n",
                   in_msg.Type);
@@ -329,13 +327,13 @@ machine(MachineType:TU, "Spandex Translation Unit")
   }
 
 
-  // WriteThrough (with CURequestor = TCP) → ReqWTD
+  // WriteThrough (with CURequestor = TCP) → ReqWT
   action(twt_translateWriteThrough, "twt",
-         desc="Translate WriteThrough → ReqWTD and forward to Spandex Dir") {
+         desc="Translate WriteThrough → ReqWT and forward to Spandex Dir") {
     peek(requestFromTCC_in, CPURequestMsg) {
       enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
         out_msg.addr        := address;
-        out_msg.Type        := SpandexRequestType:ReqWTD;
+        out_msg.Type        := SpandexRequestType:ReqWT;
         out_msg.Requestor   := machineID;
         out_msg.Destination.clear();
         out_msg.Destination.add(
@@ -345,7 +343,7 @@ machine(MachineType:TU, "Spandex Translation Unit")
         out_msg.MessageSize := MessageSizeType:Data;
         out_msg.instSeqNum  := in_msg.instSeqNum;
         DPRINTF(RubySlicc,
-          "TU: WriteThrough->ReqWTD addr=%#x\n", address);
+          "TU: WriteThrough->ReqWT addr=%#x\n", address);
       }
     }
   }
@@ -393,28 +391,9 @@ machine(MachineType:TU, "Spandex Translation Unit")
   }
 
 
-  // Atomic{Return,NoReturn} → ReqOD
-  action(ta_translateAtomic, "ta",
-         desc="Translate Atomic → ReqOD and forward to Spandex Dir") {
-    peek(requestFromTCC_in, CPURequestMsg) {
-      enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
-        out_msg.addr        := address;
-        out_msg.Type        := SpandexRequestType:ReqOD;
-        out_msg.Requestor   := machineID;
-        out_msg.Destination.clear();
-        out_msg.Destination.add(
-          mapAddressToMachine(address, MachineType:Directory));
-        out_msg.DataBlk     := in_msg.DataBlk;
-        out_msg.writeMask   := in_msg.writeMask;
-        out_msg.MessageSize := MessageSizeType:Data;
-        out_msg.instSeqNum  := in_msg.instSeqNum;
-        DPRINTF(RubySlicc,
-          "TU: Atomic->ReqOD addr=%#x return=%d\n",
-          address,
-          (in_msg.Type == CoherenceRequestType:AtomicReturn));
-      }
-    }
-  }
+  // Atomic is intentionally unsupported in this initial TU/LLC bring-up.
+  // Do not translate AtomicReturn / AtomicNoReturn to Spandex ReqOD, because
+  // the simplified Spandex LLC has no ReqOD / RMW path.
 
 
   // ── Downward translation: SpandexResponseMsg → ResponseMsg ────────────
@@ -598,7 +577,7 @@ machine(MachineType:TU, "Spandex Translation Unit")
 
   // ── Write-through (TCP store forwarded by TCC) ────────────────────────
   // TCC sends WriteThrough (CURequestor = original TCP).
-  // TU translates to ReqWTD, waits for SpxAck.
+  // TU translates to ReqWT, waits for SpxAck.
   transition(I, WriteThrough, W) {
     t_allocateTBE;
     twt_translateWriteThrough;
@@ -641,38 +620,9 @@ machine(MachineType:TU, "Spandex Translation Unit")
   // The W→I transition above handles this case since both writebacks and
   // flushes wait in state W and receive SpxWBAck.
 
-  // ── Atomic (return value) ─────────────────────────────────────────────
-  // TCC sends AtomicReturn (at_atomicThrough action).
-  // TU translates to ReqOD, waits for SpxAtomicResp.
-  transition(I, AtomicReturn, W) {
-    t_allocateTBE;
-    ta_translateAtomic;
-    p_popRequestQueue;
-  }
-
-  transition(W, SpxAtomicResp, I) {
-    far_forwardAtomicResp;
-    w_wakeUp;
-    dt_deallocateTBE;
-    pr_popResponseQueue;
-  }
-
-  // ── Atomic (no return value) ──────────────────────────────────────────
-  // TCC sends AtomicNoReturn (at_atomicThrough action).
-  // TU translates to ReqOD, waits for SpxAtomicDone.
-  transition(I, AtomicNoReturn, W) {
-    t_allocateTBE;
-    ta_translateAtomic;
-    p_popRequestQueue;
-  }
-
-
-  transition(W, SpxAtomicDone, I) {
-    fad_forwardAtomicDone;
-    w_wakeUp;
-    dt_deallocateTBE;
-    pr_popResponseQueue;
-  }
+  // ── Atomic unsupported ────────────────────────────────────────────────
+  // AtomicReturn / AtomicNoReturn are rejected in requestFromTCC_in above.
+  // Therefore TU never sends ReqOD and should never wait for AtomicResp/Done.
 
   // ── Unblock absorption ────────────────────────────────────────────────
   // TCC sends UnblockMsg (vnet 4) after sdr_sendDataResponse / rb_bypassDone.
@@ -686,8 +636,7 @@ machine(MachineType:TU, "Spandex Translation Unit")
   // If a new request arrives for an address already in state W
   // (previous request still in-flight to Spandex Dir), stall it.
   // wakeUpAllBuffers in the completion transitions will retry it.
-  transition(W, {RdBlk, WriteThrough, WriteBack,
-                 WriteFlush, AtomicReturn, AtomicNoReturn}) {
+  transition(W, {RdBlk, WriteThrough, WriteBack, WriteFlush}) {
     z_stallAndWait;
   }
 }

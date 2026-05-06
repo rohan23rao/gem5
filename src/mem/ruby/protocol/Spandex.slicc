@@ -1,12 +1,22 @@
 protocol "Spandex";
-include "GPU_VIPER-msg.sm";     // CPURequestMsg, ResponseMsg, NBProbeRequestMsg,
-                                // UnblockMsg - all used by TCC and TU
-include "Spandex-msg.sm";       // SpandexRequestMsg, SpandexResponseMsg
-include "GPU_VIPER-TCP.sm";     // TCP L1 data cache (keeping the GPU coherence architecture intact) 
-include "GPU_VIPER-SQC.sm";     // SQC L1 instruction cache (keeping the GPU coherence intact)
-include "Spandex_TU.sm";        // Translation Unit between 'TCC and Spandex LLC'
-include "GPU_VIPER-TCC.sm";     // TCC L2 cache (keeping this intact as well - still talks to
-                                // Machine Type:Directory via vnets 0/2/4, 
-                                // but TU intercepts those messages)
-include "Spandex-dir.sm";       // Spandex LLC/Directory
-include "Spandex-DMA.sm";       // DMA Controller
+
+include "RubySlicc_interfaces.slicc";
+
+include "MOESI_AMD_Base-msg.sm";
+include "GPU_VIPER-msg.sm";
+include "Spandex-msg.sm";
+
+// 先宣告 Directory，因為 TU / DMA 會用 MachineType:Directory
+include "Spandex_LLC.sm";
+
+// 再宣告 TU，因為 TCC 會用 MachineType:TU
+include "Spandex_TU.sm";
+
+// 再宣告 TCC，因為它會送 request 給 TU
+include "GPU_VIPER-TCC.sm";
+
+// TCP/SQC 放後面
+include "GPU_VIPER-TCP.sm";
+include "GPU_VIPER-SQC.sm";
+
+include "Spandex-DMA.sm";
