@@ -94,9 +94,96 @@ class TCCCache(RubyCache):
             self.replacement_policy = ObjectList.rp_list.get(options.tcc_rp)()
 
 
+
+# ── Safe MessageBuffer auto-wiring helpers ───────────────────────────────
+# These prevent runtime "without default or user set value" errors when a
+# generated controller has a MessageBuffer param that the config forgot to set.
+def _has_param(ctrl, pname):
+    return hasattr(ctrl, "_params") and pname in ctrl._params
+
+def _is_set(ctrl, pname):
+    return hasattr(ctrl, "_values") and pname in ctrl._values
+
+def _mb_in(ctrl, pname, network, ordered=True):
+    # Message comes FROM network INTO controller.
+    # Do not overwrite an existing MessageBuffer; overwriting creates orphan buffers.
+    if _has_param(ctrl, pname) and not _is_set(ctrl, pname):
+        mb = MessageBuffer(ordered=ordered)
+        setattr(ctrl, pname, mb)
+        getattr(ctrl, pname).in_port = network.out_port
+
+def _mb_out(ctrl, pname, network, ordered=True):
+    # Message goes FROM controller OUT TO network.
+    # Do not overwrite an existing MessageBuffer; overwriting creates orphan buffers.
+    if _has_param(ctrl, pname) and not _is_set(ctrl, pname):
+        mb = MessageBuffer(ordered=ordered)
+        setattr(ctrl, pname, mb)
+        getattr(ctrl, pname).out_port = network.in_port
+
+def _mb_internal(ctrl, pname, ordered=True):
+    # Internal queue, no network port.
+    if _has_param(ctrl, pname) and not _is_set(ctrl, pname):
+        setattr(ctrl, pname, MessageBuffer(ordered=ordered))
+
+def _wire_tcp(ctrl, network):
+    _mb_out(ctrl, "requestFromTCP", network)
+    _mb_in(ctrl, "responseToTCP", network)
+    _mb_in(ctrl, "probeToTCP", network)
+    _mb_out(ctrl, "responseFromTCP", network)
+    _mb_out(ctrl, "unblockFromCore", network)
+    _mb_internal(ctrl, "mandatoryQueue", ordered=False)
+
+def _wire_sqc(ctrl, network):
+    _mb_out(ctrl, "requestFromSQC", network)
+    _mb_in(ctrl, "responseToSQC", network)
+
+    # Required by SQC_Controller even if probes are unused.
+    _mb_in(ctrl, "probeToSQC", network)
+    _mb_out(ctrl, "responseFromSQC", network)
+    _mb_out(ctrl, "unblockFromCore", network)
+
+    _mb_internal(ctrl, "mandatoryQueue", ordered=False)
+    _mb_internal(ctrl, "triggerQueue")
+
+def _wire_tcc(ctrl, network):
+    _mb_in(ctrl, "requestFromTCP", network)
+    _mb_out(ctrl, "responseToCore", network)
+    _mb_in(ctrl, "unblockFromCore", network)
+
+    _mb_out(ctrl, "requestToNB", network)
+    _mb_in(ctrl, "responseFromNB", network)
+    _mb_in(ctrl, "probeFromNB", network)
+    _mb_out(ctrl, "responseToNB", network)
+    _mb_out(ctrl, "unblockToNB", network)
+
+    _mb_internal(ctrl, "triggerQueue")
+
+def _wire_tu(ctrl, network):
+    _mb_in(ctrl, "requestFromTCC", network)
+    _mb_out(ctrl, "probeToTCC", network)
+    _mb_out(ctrl, "responseToTCC", network)
+    _mb_in(ctrl, "unblockFromTCC", network)
+
+    _mb_out(ctrl, "requestToDir", network)
+    _mb_in(ctrl, "responseFromDir", network)
+
+    _mb_internal(ctrl, "triggerQueue")
+
+def _wire_dir(ctrl, network):
+    _mb_in(ctrl, "requestFromTU", network)
+    _mb_out(ctrl, "responseToTU", network)
+    _mb_in(ctrl, "requestFromDMA", network)
+    _mb_out(ctrl, "responseToDMA", network)
+    _mb_internal(ctrl, "triggerQueue")
+
+def _wire_dma(ctrl, network):
+    _mb_out(ctrl, "requestToDir", network)
+    _mb_in(ctrl, "responseFromDir", network)
+    _mb_internal(ctrl, "mandatoryQueue", ordered=False)
+
 # ── Controller classes ────────────────────────────────────────────────────────
 
-class TCPCntrl(GPU_VIPER_TCP_Controller, CntrlBase):
+class TCPCntrl(TCP_Controller, CntrlBase):
     """
     GPU L1 data cache — uses the unmodified GPU_VIPER TCP controller.
     Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
@@ -194,7 +281,7 @@ class SQCCache(RubyCache):
             self.replacement_policy = ObjectList.rp_list.get(options.sqc_rp)()
 
 
-class SQCCntrl(GPU_VIPER_SQC_Controller, CntrlBase):
+class SQCCntrl(SQC_Controller, CntrlBase):
     """
     GPU L1 instruction cache — uses unmodified GPU_VIPER SQC controller.
     Sends CPURequestMsg to TCC on vnet 1, receives ResponseMsg on vnet 3.
@@ -226,7 +313,7 @@ class SQCCntrl(GPU_VIPER_SQC_Controller, CntrlBase):
             self.recycle_latency = options.recycle_latency
 
 
-class TCCCntrl(GPU_VIPER_TCC_Controller, CntrlBase):
+class TCCCntrl(TCC_Controller, CntrlBase):
     """
     GPU L2 shared cache — unmodified GPU_VIPER TCC controller.
     Receives CPURequestMsg from TCP/SQC on vnet 1.
@@ -294,7 +381,7 @@ class L3Cache(RubyCache):
         self.replacement_policy = TreePLRURP()
 
 
-class DirCntrl(Spandex_Directory_Controller, CntrlBase):
+class DirCntrl(Directory_Controller, CntrlBase):
     """
     Spandex LLC + Directory.
     Receives SpandexRequestMsg from TU on vnet 1.
@@ -462,6 +549,7 @@ def construct_tcps(options, system, ruby_system, network):
             number_of_TBEs=2560,
         )
         tcp_cntrl.create(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_tcp(tcp_cntrl, network)
         tcp_cntrl.WB = options.WB_L1
         tcp_cntrl.disableL1 = options.noL1
         tcp_cntrl.L1cache.tagAccessLatency = options.TCP_latency
@@ -480,6 +568,16 @@ def construct_tcps(options, system, ruby_system, network):
         tcp_cntrl.responseToTCP = MessageBuffer(ordered=True)
         tcp_cntrl.responseToTCP.in_port = network.out_port
 
+        # Required by TCP_Controller even if probes/unblocks are unused.
+        tcp_cntrl.probeToTCP = MessageBuffer(ordered=True)
+        tcp_cntrl.probeToTCP.in_port = network.out_port
+
+        tcp_cntrl.responseFromTCP = MessageBuffer(ordered=True)
+        tcp_cntrl.responseFromTCP.out_port = network.in_port
+
+        tcp_cntrl.unblockFromCore = MessageBuffer(ordered=True)
+        tcp_cntrl.unblockFromCore.out_port = network.in_port
+
         tcp_cntrl.mandatoryQueue = MessageBuffer()
 
     return (tcp_sequencers, tcp_cntrl_nodes)
@@ -495,6 +593,7 @@ def construct_sqcs(options, system, ruby_system, network):
     for i in range(options.num_sqc):
         sqc_cntrl = SQCCntrl(TCC_select_num_bits=tcc_bits)
         sqc_cntrl.create(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_sqc(sqc_cntrl, network)
 
         exec("ruby_system.sqc_cntrl%d = sqc_cntrl" % i)
 
@@ -508,6 +607,16 @@ def construct_sqcs(options, system, ruby_system, network):
         # TCC → SQC: ResponseMsg on vnet 3
         sqc_cntrl.responseToSQC = MessageBuffer(ordered=True)
         sqc_cntrl.responseToSQC.in_port = network.out_port
+
+        # Required by SQC_Controller even if probes/unblocks are unused.
+        sqc_cntrl.probeToSQC = MessageBuffer(ordered=True)
+        sqc_cntrl.probeToSQC.in_port = network.out_port
+
+        sqc_cntrl.responseFromSQC = MessageBuffer(ordered=True)
+        sqc_cntrl.responseFromSQC.out_port = network.in_port
+
+        sqc_cntrl.unblockFromCore = MessageBuffer(ordered=True)
+        sqc_cntrl.unblockFromCore.out_port = network.in_port
 
         sqc_cntrl.mandatoryQueue = MessageBuffer()
 
@@ -528,10 +637,10 @@ def construct_tccs(options, system, ruby_system, network):
 
     for i in range(options.num_tccs):
         tcc_cntrl = TCCCntrl(
-            TCC_select_num_bits=tcc_bits,
             number_of_TBEs=options.num_tbes,
         )
         tcc_cntrl.create(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_tcc(tcc_cntrl, network)
 
         exec("ruby_system.tcc_cntrl%d = tcc_cntrl" % i)
         tcc_cntrl_nodes.append(tcc_cntrl)
@@ -539,6 +648,13 @@ def construct_tccs(options, system, ruby_system, network):
         # TCP/SQC → TCC: CPURequestMsg on vnet 1
         tcc_cntrl.requestFromTCP = MessageBuffer(ordered=True)
         tcc_cntrl.requestFromTCP.in_port = network.out_port
+
+        # TCC -> TCP/SQC responses.
+        tcc_cntrl.responseToCore = MessageBuffer(ordered=True)
+        tcc_cntrl.responseToCore.out_port = network.in_port
+
+        # Internal TCC trigger queue.
+        tcc_cntrl.triggerQueue = MessageBuffer(ordered=True)
 
         # TCC → TCP/SQC: ResponseMsg on vnet 3
         tcc_cntrl.responseToTCP = MessageBuffer(ordered=True)
@@ -596,6 +712,7 @@ def construct_tus(options, system, ruby_system, network):
             number_of_TBEs=options.num_tbes,
         )
         tu_cntrl.create(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_tu(tu_cntrl, network)
 
         exec("ruby_system.tu_cntrl%d = tu_cntrl" % i)
         tu_cntrl_nodes.append(tu_cntrl)
@@ -650,6 +767,18 @@ def construct_cpus(options, system, ruby_system, network):
             number_of_TBEs=256,
         )
         cpu_cntrl.createCP(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_tcp(cpu_cntrl, network)
+        # Required by TCP_Controller even if probes are unused.
+        cpu_cntrl.probeToTCP = MessageBuffer(ordered=True)
+        cpu_cntrl.probeToTCP.in_port = network.out_port
+
+        # Required by TCP_Controller for probe/writeback responses.
+        cpu_cntrl.responseFromTCP = MessageBuffer(ordered=True)
+        cpu_cntrl.responseFromTCP.out_port = network.in_port
+
+        # Required by TCP_Controller for unblock messages.
+        cpu_cntrl.unblockFromCore = MessageBuffer(ordered=True)
+        cpu_cntrl.unblockFromCore.out_port = network.in_port
         cpu_cntrl.WB = options.WB_L1
         cpu_cntrl.disableL1 = options.noL1
 
@@ -674,7 +803,7 @@ def construct_dmas(options, system, ruby_system, network, dma_devices):
 
     for i, dma_device in enumerate(dma_devices):
         dma_seq = DMASequencer(version=i, ruby_system=ruby_system)
-        dma_cntrl = Spandex_DMA_Controller(
+        dma_cntrl = DMA_Controller(
             version=i,
             dma_sequencer=dma_seq,
             ruby_system=ruby_system,
@@ -717,6 +846,7 @@ def construct_scalars(options, system, ruby_system, network):
     for i in range(options.num_scalar_cache):
         scalar_cntrl = SQCCntrl(TCC_select_num_bits=tcc_bits)
         scalar_cntrl.create(options, ruby_system, system)
+        # DISABLED_ORPHAN_DEBUG _wire_sqc(scalar_cntrl, network)
 
         exec("ruby_system.scalar_cntrl%d = scalar_cntrl" % i)
 
@@ -728,6 +858,16 @@ def construct_scalars(options, system, ruby_system, network):
 
         scalar_cntrl.responseToSQC = MessageBuffer(ordered=True)
         scalar_cntrl.responseToSQC.in_port = network.out_port
+
+        # Required by SQC_Controller even if probes/unblocks are unused.
+        scalar_cntrl.probeToSQC = MessageBuffer(ordered=True)
+        scalar_cntrl.probeToSQC.in_port = network.out_port
+
+        scalar_cntrl.responseFromSQC = MessageBuffer(ordered=True)
+        scalar_cntrl.responseFromSQC.out_port = network.in_port
+
+        scalar_cntrl.unblockFromCore = MessageBuffer(ordered=True)
+        scalar_cntrl.unblockFromCore.out_port = network.in_port
 
         scalar_cntrl.mandatoryQueue = MessageBuffer()
 
@@ -821,6 +961,6 @@ def create_system(
     #   2 — TU  → TCC responses / TCC → TU probe acks (stub)
     #   3 — Dir → TU responses /  TCC → TCP/SQC responses
     #   4 — TCC → TU unblock (absorbed by TU)
-    ruby_system.network.number_of_virtual_networks = 5
+    ruby_system.network.number_of_virtual_networks = 6
 
     return (cpu_sequencers, dir_cntrl_nodes, mainCluster)

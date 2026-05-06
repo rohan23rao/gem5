@@ -4,7 +4,7 @@
 //   - VIPER TCC talks to a TU.
 //   - TU translates VIPER messages into Spandex ReqV / ReqWTD / ReqWB.
 //   - This LLC supports read, full-line write-through, and full-line writeback.
-//   - Atomic / ReqOD and partial writes are not supported.
+//   - Partial writes use writeMask/copyPartial; ReqOD atomics use atomicPartial.
 //   - ReqWTD / ReqWB update the LLC only; they do not write DRAM every time.
 //   - DRAM is updated only when a valid LLC line is evicted / replaced.
 
@@ -325,7 +325,8 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
           }
 
         // 如果 request 是 full-line write-through
-        } else if (in_msg.Type == SpandexRequestType:ReqWT) {
+        } else if (in_msg.Type == SpandexRequestType:ReqWT ||
+                   in_msg.Type == SpandexRequestType:ReqWTD) {
 
           // 如果 L3 有這條 line，或有空間 allocate，就直接觸發 write-through event
           if (is_valid(cache_entry) || L3cache.cacheAvail(in_msg.addr)) {
@@ -354,7 +355,12 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
         
         // 其他類型的 request 在這個簡化模型裡不支援，直接報錯
         } else if (in_msg.Type == SpandexRequestType:ReqOD) {
-          error("ReqOD / atomic is not supported in simplified spandex_llc.sm");
+          if (is_valid(cache_entry) || L3cache.cacheAvail(in_msg.addr)) {
+            trigger(Event:ReqOD, in_msg.addr, cache_entry, tbe);
+          } else {
+            Addr victim := L3cache.cacheProbe(in_msg.addr);
+            trigger(Event:Replacement, victim, getL3CacheEntry(victim), TBEs.lookup(victim));
+          }
         } else {
           error("Unexpected request type to simplified Spandex LLC");
         }
@@ -451,10 +457,20 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
   }
 
   // 把 request 帶的 full-line data 寫進 L3 (replace old data in the line)
-  action(wl3r_writeReqDataToL3, "wl3r", desc="Write full request data to L3") {
+  action(wl3r_writeReqDataToL3, "wl3r", desc="Write request data to L3 with write-mask support") {
     peek(requestToDir_in, SpandexRequestMsg) {
       assert(is_valid(cache_entry));
-      cache_entry.DataBlk := in_msg.DataBlk; // 把 request 的 data 整條覆蓋到 L3 cache line
+
+      // If mask is full, normal full-line overwrite.
+      // If mask is empty, preserve old behavior and treat request as full-line data.
+      // Otherwise, merge only the bytes selected by writeMask.
+      if (in_msg.writeMask.isFull()) {
+        cache_entry.DataBlk := in_msg.DataBlk;
+      } else if (in_msg.writeMask.isEmpty()) {
+        cache_entry.DataBlk := in_msg.DataBlk;
+      } else {
+        cache_entry.DataBlk.copyPartial(in_msg.DataBlk, in_msg.writeMask);
+      }
     }
   }
 
@@ -523,7 +539,36 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     }
   }
 
-  // --- Queue / wakeup management ---
+// --- Atomic handling ---
+  action(ado_atomicDataOp, "ado", desc="Apply atomic op to L3 and send AtomicResp/AtomicDone") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      assert(is_valid(cache_entry));
+
+      DataBlock oldData := cache_entry.DataBlk;
+
+      // atomicPartial applies the AtomicOpFunctor encoded in writeMask.
+      cache_entry.DataBlk.atomicPartial(in_msg.DataBlk, in_msg.writeMask);
+
+      enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+        out_msg.addr := address;
+
+        if (in_msg.atomicReturn) {
+          out_msg.Type := SpandexResponseType:AtomicResp;
+          out_msg.DataBlk := oldData;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+        } else {
+          out_msg.Type := SpandexResponseType:AtomicDone;
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+    // --- Queue / wakeup management ---
 
   // pop request queue
   action(prq_popRequestQueue, "prq", desc="Pop request queue") {
@@ -597,6 +642,15 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
 
   // Memory ack in invalid state -- defensive dequeue.
   // 如果在 I state 收到 memory ack，就把 memory queue pop 掉
+  // Atomic miss/first-touch path.
+  // Best effort: allocate LLC line and apply the atomic to the new line.
+  transition(I, ReqOD, V) {L3TagArrayRead, L3TagArrayWrite, L3DataArrayWrite} {
+    al3_allocateL3;
+    wl3r_writeReqDataToL3;
+    ado_atomicDataOp;
+    prq_popRequestQueue;
+  }
+
   transition(I, MemAck) {
     pmq_popMemQueue;
   }
@@ -620,6 +674,12 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
   transition(V, ReqWB) {L3TagArrayRead, L3DataArrayWrite} {
     wl3r_writeReqDataToL3;
     swba_sendWBAck;
+    prq_popRequestQueue;
+  }
+
+  // Atomic hit path.
+  transition(V, ReqOD, V) {L3TagArrayRead, L3DataArrayRead, L3DataArrayWrite} {
+    ado_atomicDataOp;
     prq_popRequestQueue;
   }
 

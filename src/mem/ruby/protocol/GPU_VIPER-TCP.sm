@@ -303,7 +303,8 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
         Entry cache_entry := getCacheEntry(in_msg.LineAddress);
         TBE tbe := TBEs.lookup(in_msg.LineAddress);
         DPRINTF(RubySlicc, "%s\n", in_msg);
-        if (in_msg.Type == RubyRequestType:LD) {
+        if (in_msg.Type == RubyRequestType:LD ||
+            in_msg.Type == RubyRequestType:IFETCH) {
           // Read requests with GLC or SLC bit set should not cache in the L1.
           // They need to bypass the L1 and go to the L2.  If an entry exists in
           // the L1, it needs to be evicted, and if no entry or invalid entry in
