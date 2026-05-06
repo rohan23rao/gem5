@@ -1,6 +1,6 @@
 protocol "Spandex";
 
-include "RubySlicc_interfaces.slicc";
+//include "RubySlicc_interfaces.slicc";
 
 include "MOESI_AMD_Base-msg.sm";
 include "GPU_VIPER-msg.sm";
@@ -10,7 +10,7 @@ include "Spandex-msg.sm";
 include "Spandex_LLC.sm";
 
 // 再宣告 TU，因為 TCC 會用 MachineType:TU
-include "Spandex_TU.sm";
+include "TU.sm";
 
 // 再宣告 TCC，因為它會送 request 給 TU
 include "GPU_VIPER-TCC.sm";

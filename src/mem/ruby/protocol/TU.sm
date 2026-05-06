@@ -54,7 +54,7 @@
 *  no transitions use them in the initial implementation.
 */
 
-machine(MachineType:TU, "Spandex Translation Unit")
+machine(MachineType:Spandex_TU, "Spandex Translation Unit")
   : Cycles tu_latency := 1;
     int TCC_select_num_bits;
     int number_of_TBEs := 256;
@@ -89,13 +89,15 @@ machine(MachineType:TU, "Spandex Translation Unit")
                   virtual_network="3", vnet_type="response";
 
 {
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
   // ── STATES ─────────────────────────────────────────────────────────────
   //
   // The TU has no cache.  State is per-address in the TBE only.
   // A TBE entry exists only while a request is in-flight to Spandex Dir.
   //
   state_declaration(State, desc="TU per-address states",
-                    default="TU_State_I") {
+                    default="Spandex_TU_State_I") {
     I,  AccessPermission:Invalid,
           desc="Idle — no outstanding request for this address";
     W,  AccessPermission:Busy,
@@ -157,7 +159,7 @@ machine(MachineType:TU, "Spandex Translation Unit")
     bool isPresent(Addr);
   }
 
-  TBETable TBEs, template="<TU_TBE>", constructor="m_number_of_TBEs";
+  TBETable TBEs, template="<Spandex_TU_TBE>", constructor="m_number_of_TBEs";
 
   // ── SLICC boilerplate ──────────────────────────────────────────────────
   Tick clockEdge();
@@ -188,14 +190,23 @@ machine(MachineType:TU, "Spandex Translation Unit")
   }
 
   int functionalWrite(Addr addr, Packet *pkt) {
-    return functionalMemoryWrite(pkt);
+    if (functionalMemoryWrite(pkt)) {
+      return 1;
+    }
+    return 0;
   }
 
   AccessPermission getAccessPermission(Addr addr) {
     TBE tbe := TBEs.lookup(addr);
+
     if (is_valid(tbe)) {
-      return TU_State_to_permission(tbe.TBEState);
+      if (tbe.TBEState == State:I) {
+        return AccessPermission:Invalid;
+      } else if (tbe.TBEState == State:W) {
+        return AccessPermission:Busy;
+      }
     }
+
     return AccessPermission:NotPresent;
   }
 

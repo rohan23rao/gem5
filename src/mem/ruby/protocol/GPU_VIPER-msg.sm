@@ -31,13 +31,13 @@ structure(GPUCoalescer, external = "yes") {
   void recordCPWriteCallBack(MachineID, MachineID);
 }
 
-structure(VIPERCoalescer, external = "yes") {
+structure (VIPERCoalescer, external = "yes") {
   void readCallback(Addr, DataBlock);
-  void readCallback(Addr, MachineType, DataBlock);
-  void readCallback(Addr, MachineType, DataBlock,
-                    Cycles, Cycles, Cycles);
+  void readCallback(Addr, MachineType, DataBlock, bool);
   void readCallback(Addr, MachineType, DataBlock,
                     Cycles, Cycles, Cycles, bool);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool, bool);
   void writeCallback(Addr, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock);
   void writeCallback(Addr, MachineType, DataBlock,
@@ -46,6 +46,7 @@ structure(VIPERCoalescer, external = "yes") {
                      Cycles, Cycles, Cycles, bool);
   void atomicCallback(Addr, MachineType, DataBlock);
   void invTCPCallback(Addr);
+  void invTCCCallback(Addr);
   void writeCompleteCallback(Addr, uint64_t);
   void evictionCallback(Addr);
 }

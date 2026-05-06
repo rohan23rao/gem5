@@ -285,6 +285,7 @@ enumeration(MachineType, desc="...", default="MachineType_NULL") {
     Cache,       desc="Generic coherent cache controller";
     Memory,      desc="Memory controller interface";
     MiscNode,    desc="CHI protocol Misc Node";
+    Spandex_TU, desc="Spandex Translation Unit";
     NULL,        desc="null mach type";
 }
 
