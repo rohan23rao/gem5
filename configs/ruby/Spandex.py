@@ -689,8 +689,20 @@ def construct_cpus(options, system, ruby_system, network):
         cpu_sequencers_local.append(cpu_cntrl.sequencer)
         cpu_cntrl_nodes.append(cpu_cntrl)
 
+        # Match the GPU TCP wiring exactly — TCP machine is the same SLICC
+        # machine for both GPU and CPU modes (TCP-as-CPU pattern), so it
+        # declares the full set of MessageBuffer ports.
         cpu_cntrl.requestFromTCP = MessageBuffer(ordered=True)
         cpu_cntrl.requestFromTCP.out_port = network.in_port
+
+        cpu_cntrl.responseFromTCP = MessageBuffer(ordered=True)
+        cpu_cntrl.responseFromTCP.out_port = network.in_port
+
+        cpu_cntrl.unblockFromCore = MessageBuffer()
+        cpu_cntrl.unblockFromCore.out_port = network.in_port
+
+        cpu_cntrl.probeToTCP = MessageBuffer(ordered=True)
+        cpu_cntrl.probeToTCP.in_port = network.out_port
 
         cpu_cntrl.responseToTCP = MessageBuffer(ordered=True)
         cpu_cntrl.responseToTCP.in_port = network.out_port

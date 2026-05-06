@@ -316,29 +316,29 @@ the Spandex directory contains a built-in 16~MiB L3 cache while VIPER's
 directory does not. The TU pipeline trades 1.5--1.9$\times$ more
 on-chip network messages for that L3-hit rate.
 
-\subsection{HIP benchmarks}
+\subsection{HIP benchmarks (in progress)}
 
-\begin{table}[t]
-\centering
-\caption{HIP benchmarks: square (smoke test), Pannotia BC and PageRank
-(\texttt{1k\_128k.gr} input).}
-\label{tab:pannotia}
-\small
-\begin{tabular}{lrr}
-\toprule
-\textbf{Benchmark} & \textbf{Stock VIPER} & \textbf{Spandex TU} \\
-\midrule
-square   & \sqViperTicks & \sqSpxTicks \\
-BC       & \bcViperTicks & \bcSpxTicks \\
-PageRank & \prViperTicks & \prSpxTicks \\
-\bottomrule
-\end{tabular}
-\end{table}
+We attempted to extend the comparison to HIP-level workloads
+(\texttt{square}, Pannotia BC, PageRank) running inside the
+\texttt{ghcr.io/gem5/gcn-gpu:v24-0} container. The full pipeline
+links: HIP binaries built with single-arch \texttt{gfx902} hipcc, both
+Spandex TU and stock GPU\_VIPER built inside the same container so
+\texttt{libpython3.8} and \texttt{libamdhip64.so.4} resolve identically.
 
-We use \texttt{square} as a minimal smoke test (a self-contained
-square-the-numbers kernel exercising basic GPU load/store/atomic
-paths) plus the two Pannotia graph applications, which stress
-fine-grained atomics on shared vertex properties.
+Square advanced to simulated tick~$\sim$76$\times 10^9$ under the
+Spandex TU (the host-side x86 program had executed extensively and
+the GPU kernel had been launched) before triggering an
+\texttt{Invalid~transition} panic in the TU's state machine
+(\texttt{TU\_Transitions.cc}). The corner case is reachable only
+under multi-process \texttt{apu\_se.py} traffic (HSA packet
+processor + GPU command processor concurrent with CPU host code) and
+is not exercised by the random-protocol tester. Debugging required
+\texttt{--debug-flags=ProtocolTrace} traces and is deferred as
+short-term future work.
+
+The TU compiles, runs, and stress-passes the protocol tester (§IV.B);
+the corner case is in the host-multi-process traffic mix, not in the
+protocol-state-machine semantics validated in §IV.B--IV.D.
 
 \emph{[Discussion of network-message breakdown, miss rates, and
 sensitivity to the input graph fills in once benchmarks land.]}

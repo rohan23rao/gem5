@@ -303,13 +303,15 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
         Entry cache_entry := getCacheEntry(in_msg.LineAddress);
         TBE tbe := TBEs.lookup(in_msg.LineAddress);
         DPRINTF(RubySlicc, "%s\n", in_msg);
-        if (in_msg.Type == RubyRequestType:LD) {
+        if (in_msg.Type == RubyRequestType:LD ||
+            in_msg.Type == RubyRequestType:IFETCH) {
           // Read requests with GLC or SLC bit set should not cache in the L1.
           // They need to bypass the L1 and go to the L2.  If an entry exists in
           // the L1, it needs to be evicted, and if no entry or invalid entry in
           // the L1, still need to bypass.  The LoadBypassEvict Event handles
           // both cases in its transitions below, so call LoadBypassEvict for
           // both.
+          // CPU IFETCH (instruction fetch) is treated as an LD here.
           if ((in_msg.isGLCSet || in_msg.isSLCSet)) {
             trigger(Event:LoadBypassEvict, in_msg.LineAddress, cache_entry, tbe);
           }
@@ -333,9 +335,15 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
               trigger(Event:Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
             }
           } // end if (disableL1)
-        } else if (in_msg.Type == RubyRequestType:FLUSH) {
+        } else if (in_msg.Type == RubyRequestType:FLUSH ||
+                   in_msg.Type == RubyRequestType:Release) {
+            // CPU release fence: write-through TCP has nothing dirty,
+            // so a flush is a near-noop, but we honor it.
             trigger(Event:Flush, in_msg.LineAddress, cache_entry, tbe);
-        } else if (in_msg.Type == RubyRequestType:REPLACEMENT){
+        } else if (in_msg.Type == RubyRequestType:REPLACEMENT ||
+                   in_msg.Type == RubyRequestType:Acquire){
+            // CPU acquire fence: drop the line so subsequent loads
+            // re-fetch from LLC. Same effect as REPLACEMENT.
             trigger(Event:Evict, in_msg.LineAddress, cache_entry, tbe);
         } else if (in_msg.Type == RubyRequestType:InvL2){
             trigger(Event:InvL2, in_msg.LineAddress, cache_entry, tbe);
@@ -643,8 +651,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   action(inv_invDone, "inv", desc="local inv done") {
     if (use_seq_not_coal) {
-        DPRINTF(RubySlicc, "Sequencer does not define invCallback!\n");
-        assert(false);
+      // CPU mode: sequencer's invL1Callback fires when the L1 line
+      // is dropped (Acquire fence completion).
+      sequencer.invL1Callback();
     } else {
       coalescer.invTCPCallback(address);
     }
@@ -668,8 +677,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   action(i2r_invL2Resp, "i2r", desc="Invalidate L2 completed") {
     if (use_seq_not_coal) {
-        DPRINTF(RubySlicc, "Sequencer does not define invTCCCallback!\n");
-        assert(false);
+      // CPU mode: sequencer's invL1Callback fires when the cache
+      // line is dropped locally; no separate L2-invalidation callback.
+      sequencer.invL1Callback();
     } else {
       coalescer.invTCCCallback(address);
     }
@@ -677,8 +687,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   action(wd_wtDone, "wd", desc="writethrough done") {
     if (use_seq_not_coal) {
-      DPRINTF(RubySlicc, "Sequencer does not define writeCompleteCallback!\n");
-      assert(false);
+      // Sequencer was already told the write completed at issue time
+      // (writeCallback() was called in sf_setRequestData / similar).
+      // Nothing further to do on WT-Ack in CPU mode.
     } else {
       peek(responseToTCP_in, ResponseMsg) {
         coalescer.writeCompleteCallback(address, in_msg.instSeqNum);
