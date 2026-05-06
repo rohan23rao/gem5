@@ -1,0 +1,3 @@
+cpu_count,dir_memory_msgs,dir_request_msgs,dir_response_msgs,hostSeconds,m5out,net_data_msgs,net_request_ctrl_msgs,net_response_ctrl_msgs,net_response_data_msgs,net_total_msgs,simSeconds,simTicks,sqc_count,stats_present,tcc_count,tcc_hit_rate,tcp_count,tcp_hit_rate,tcp_hits,tcp_misses
+0,798.0,2293.0,2293.0,0.2,m5out_spandex_medium,5487.0,3781.0,2064.0,5032.0,16364.0,7.8e-05,77511.0,1,True,1,0.0012964563526361278,4,0.002011060834590246,4.0,1985.0
+0,2543.0,1218626.0,1218626.0,55.96,m5out_spandex_large,3061906.0,1813570.0,1123544.0,2628294.0,8627314.0,0.052166,52166435.0,2,True,1,0.0025189701741467727,8,0.0006542397193360795,665.0,1015782.0

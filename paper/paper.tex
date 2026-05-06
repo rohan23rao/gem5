@@ -1,0 +1,380 @@
+% ECE 757 Final Project — Spandex Coherence in gem5
+% IEEE conference template, two-column, 4 pages.
+%
+% Build:  cd paper && latexmk -pdf paper.tex
+% Or:     cd paper && pdflatex paper.tex && pdflatex paper.tex
+%
+% Numbers in §IV are sourced directly from results/comparison.csv;
+% update the \def\... commands at the top when new runs land.
+
+\documentclass[conference,letterpaper,10pt]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+% --- Numbers from results/comparison.csv (UPDATE after runs) -----------------
+\def\spxRTsmall{4{,}162}
+\def\spxRTmedium{77{,}511}
+\def\spxRTlarge{52{,}166{,}435}
+\def\spxRTlargeSimplified{33{,}174{,}089}
+\def\spxRToverhead{57.2}
+
+\def\viperRTsmall{TBD}
+\def\viperRTmedium{TBD}
+\def\viperRTlarge{TBD}
+
+\def\bcSpxTicks{TBD}
+\def\bcViperTicks{TBD}
+\def\prSpxTicks{TBD}
+\def\prViperTicks{TBD}
+% -----------------------------------------------------------------------------
+
+\title{Spandex Coherence in gem5: A Translation-Unit Bridge for VIPER GPU}
+
+\author{
+\IEEEauthorblockN{Rohan Rao, Tanya, Shao-Kai, Yash, Mohith}
+\IEEEauthorblockA{Department of Electrical and Computer Engineering\\
+University of Wisconsin--Madison\\
+\{rrao8, \ldots\}@wisc.edu}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Heterogeneous CPU--GPU systems require coherence protocols that
+accommodate fundamentally different memory access patterns: CPUs favor
+ownership-based MESI/MOESI for producer--consumer sharing, while GPUs
+benefit from write-through with self-invalidation for SIMT execution.
+gem5's mainstream GPU coherence today (GPU\_VIPER) uses VIPER on the GPU
+with a separate MOESI directory for the CPU and a fixed translation in
+between, limiting per-access flexibility.
+We implement Spandex's flexible LLC interface (Alsop \emph{et al.},
+ISCA'18) in gem5's Ruby memory system. Rather than rewriting VIPER's
+GPU L1 hierarchy, we keep TCP/SQC/TCC unmodified and insert a new
+\emph{Translation Unit (TU)} SLICC controller between TCC's
+\textsc{NB}-bound interface and a Spandex directory, mapping VIPER's
+\texttt{CPURequestMsg} vocabulary onto Spandex's request menu
+(\texttt{ReqV}/\texttt{ReqWTD}/\texttt{ReqOD}/\texttt{ReqWB}).
+We validate correctness with gem5's GPU random-protocol tester at three
+system sizes, then compare against an unmodified GPU\_VIPER baseline on
+the same tester and on Pannotia BC and PageRank.
+\end{abstract}
+
+\section{Motivation}
+
+CPUs and GPUs make fundamentally incompatible coherence demands.
+Producer--consumer code on CPUs benefits from private dirty lines,
+ownership transfers, and explicit invalidations characteristic of
+MESI/MOESI. GPU SIMT, by contrast, executes thousands of stores per
+cycle across a wavefront---making invalidation broadcasts intractable.
+GPUs instead use write-through L1s that self-invalidate at fence
+boundaries, with atomic RMW resolved at a shared point such as the L2.
+
+Forcing a single coherence policy on both sides cripples whichever side
+is the loser. gem5's GPU\_VIPER bridges the asymmetry by maintaining
+two protocols---VIPER on the GPU side, MOESI on the CPU side---with a
+hierarchical \textsc{NB} translation between them. This works but bakes
+the translation into a fixed hierarchy and prevents per-access
+adaptation.
+
+The Spandex protocol~\cite{spandex} proposes a flexible LLC
+\emph{interface} with seven request types (\texttt{ReqV}, \texttt{ReqS},
+\texttt{ReqWT}, \texttt{ReqO}, \texttt{ReqWT+data}, \texttt{ReqO+data},
+\texttt{ReqWB}), letting each device class translate its native
+operations into the request that best matches its semantics. The
+translation lives in per-device \emph{Translation Units}; native L1
+protocols are untouched. Two device flavours can reach the same LLC
+through their own TUs, demonstrating heterogeneous coherence without
+modifying device IP.
+
+\section{Background}
+
+\subsection{Spandex request menu}
+Per Spandex Table~II, GPU coherence translates \emph{Load} to
+\texttt{ReqV} (read, untracked), \emph{Store} to \texttt{ReqWT}
+(write-through with payload), atomics to \texttt{ReqOD} (ownership +
+data, RMW at LLC), and release fences to \texttt{ReqWB}. Acquire
+fences self-invalidate locally and produce no network traffic.
+
+MESI/MOESI translates \emph{Read} to \texttt{ReqS} (tracked sharer),
+\emph{Write miss} to \texttt{ReqOData}, silent S$\to$M upgrades to
+\texttt{ReqO}, and dirty evictions to \texttt{ReqWB}.
+
+\subsection{gem5 Ruby and SLICC}
+gem5's Ruby memory system models cache coherence at message-passing
+granularity. Each cache controller is a SLICC state machine: a
+\texttt{.sm} file declares states, events, message-buffer ports,
+actions, and transitions. SLICC compiles to C++. Communication uses
+\emph{virtual networks} (vnets) to prevent protocol-level deadlock.
+Each protocol is compiled into a separate \texttt{gem5.opt} binary.
+
+\subsection{GPU\_VIPER hierarchy}
+GPU\_VIPER organizes the GPU stack as
+\textsc{CU}$\to$coalescer$\to$\textsc{TCP} (L1D, per-CU) and
+\textsc{SQC} (L1I, shared)$\to$\textsc{TCC} (L2, atomic ALU)$\to$
+\textsc{NB} (Northbridge: L3 + Directory). TCC's outbound vnets 0/2/4
+connect to \textsc{NB}-implementing controllers. \emph{Our project
+replaces those destinations with a new
+\texttt{MachineType:TU}}---10 single-line edits in
+\texttt{GPU\_VIPER-TCC.sm}---without changing TCC's state machine.
+
+\section{Implementation}
+
+\subsection{Architecture}
+
+\begin{figure}[t]
+\centering
+\begin{verbatim}
+   VIPER GPU (untouched)
+   CU -> TCP/SQC -> TCC
+                    | vnets 0/2/4
+                    v
+            +-----------------+
+            |   Spandex TU    |   <-- NEW
+            | MachineType:TU  |
+            +-----------------+
+                    | vnets 1/3
+                    v
+       Spandex LLC + L3
+                    |
+                    v
+                   DRAM
+\end{verbatim}
+\caption{Architecture. The TU intercepts TCC's \textsc{NB}-bound
+traffic, translating it into Spandex requests. VIPER never knows the
+\textsc{NB} has been replaced.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{The TU SLICC controller}
+\texttt{Spandex\_TU.sm} (\textasciitilde 700~lines) declares two states
+(\texttt{I}, \texttt{W}) per address. The \texttt{W} state holds an
+in-flight Spandex request waiting on the directory; on response, the
+TU synthesizes the matching VIPER \texttt{ResponseMsg} and routes it
+back to TCC, preserving TCC's expected behaviour. The TU's TBE saves
+the original \texttt{CURequestor} (the TCP that issued the miss) so
+TCC can forward the data to the right L1.
+
+Table~\ref{tab:translation} shows the upward and downward mappings.
+Probes from the directory back to TCC are not generated: GPU coherence
+has no tracked sharers, so no \texttt{Inv}/\texttt{RvkO} traffic
+arises.
+
+\begin{table}[t]
+\centering
+\caption{TU translation table.}
+\label{tab:translation}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{TCC outbound} & \textbf{TU emits to LLC} \\
+\midrule
+\texttt{RdBlk}            & \texttt{ReqV}   \\
+\texttt{WriteThrough}     & \texttt{ReqWTD} \\
+\texttt{WriteFlush}       & \texttt{ReqWB}  \\
+\texttt{wb\_writeBack}    & \texttt{ReqWB}  \\
+\texttt{AtomicReturn}     & \texttt{ReqOD}  \\
+\texttt{AtomicNoReturn}   & \texttt{ReqOD}  \\
+\midrule
+\textbf{LLC inbound}      & \textbf{TU emits to TCC} \\
+\midrule
+\texttt{Data}             & \texttt{NBSysResp}, \texttt{DataBlk} \\
+\texttt{Ack}              & \texttt{NBSysWBAck}                  \\
+\texttt{WBAck}            & \texttt{NBSysWBAck}                  \\
+\texttt{AtomicResp}       & \texttt{NBSysResp}, \texttt{DataBlk} \\
+\texttt{AtomicDone}       & \texttt{NBSysWBAck}                  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{LLC}
+The Spandex directory is line-granular, with stable states
+\{\texttt{I}, \texttt{V}\} and transients
+\{\texttt{I\_V}, \texttt{I\_O}, \texttt{V\_I}\}. It performs atomic RMW
+in-line for \texttt{ReqOD} via \texttt{DataBlk.atomicPartial},
+eliminating the need for a separate atomic ALU at this level. We
+preserve the LLC from our simplified-Spandex baseline; this work is
+about \emph{adding} the TU to bridge VIPER, not changing the LLC.
+
+\subsection{Bring-up}
+The TU implementation we inherited was untested. Getting it to compile
+and pass the random tester required 14 distinct fixes spanning SLICC
+syntax (e.g., adding a missing \texttt{mapAddressToMachine} prototype),
+gem5 type registration (the global \texttt{MachineType} enum is closed
+and required adding \texttt{TU} to
+\texttt{RubySlicc\_Exports.sm}), Python configuration (wrong protocol
+prefix on generated SimObject classes, missing controller parameters
+on TCC, missing probe/unblock MessageBuffers on TCP/SQC/Scalar), and
+network configuration (vnet count off by one). We catalogue the full
+list in the bring-up commit message.
+
+\section{Evaluation}
+
+\subsection{Methodology}
+Both protocols are built with \texttt{scons -j\$(nproc) --linker=gold}
+against gem5~v25.1. Random tester runs use
+\texttt{configs/example/ruby\_gpu\_random\_test.py} with
+\texttt{--num-dmas 0}. HIP benchmarks (BC, PageRank from
+Pannotia~\cite{pannotia}) are built and run inside the
+\texttt{ghcr.io/gem5/gcn-gpu:v24-0} Docker image so that
+\texttt{libamdhip64.so} resolves correctly; the test graph is
+\texttt{1k\_128k.gr} from \url{dist.gem5.org}.
+
+\subsection{Random tester correctness (Spandex TU)}
+
+\begin{table}[t]
+\centering
+\caption{Random tester results, Spandex TU.}
+\label{tab:random-tester}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{System} & \textbf{Episodes} & \textbf{Final tick} & \textbf{Result} \\
+\midrule
+small  / TL=1   & 1     & \spxRTsmall  & \textbf{PASS} \\
+medium / TL=1   & 16    & \spxRTmedium & \textbf{PASS} \\
+large  / TL=100 & 3{,}200 & \spxRTlarge  & \textbf{PASS} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:random-tester} reports tick counts and pass status
+across all three system sizes. The large/TL=100 case stresses the
+protocol with $\sim$3{,}200 randomized episodes across 32 wavefronts
+on 8 CUs; passing this configuration validates that the TU's state
+machine and the Spandex directory together handle the random mix of
+loads, stores, atomics, and fences without deadlock.
+
+\subsection{Cost of preserving VIPER's hierarchy}
+Compared to a single-protocol Spandex implementation that emits
+Spandex requests directly from the GPU L1 (no TCC, no TU), the TU
+pipeline adds two extra hops per L1 miss:
+TCP$\to$TCC$\to$TU$\to$\textsc{Dir}.
+
+\begin{table}[t]
+\centering
+\caption{TU pipeline cost vs.\ single-protocol Spandex.}
+\label{tab:overhead}
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{Large/TL=100 ticks} & \textbf{Ratio} \\
+\midrule
+Simplified Spandex (no TU) & \spxRTlargeSimplified & 1.00$\times$ \\
+Spandex TU (this work)     & \spxRTlarge          & 1.57$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \spxRToverhead\% overhead is the cost of routing every miss
+through a real GPU L2 plus the TU. Whether it is worth paying depends
+on the value of leaving VIPER's L1 stack untouched---the central
+benefit of the translation-unit pattern.
+
+\subsection{Comparison with stock GPU\_VIPER}
+
+\begin{table}[t]
+\centering
+\caption{Random tester: TU vs.\ stock GPU\_VIPER.}
+\label{tab:viper-cmp}
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{System} & \textbf{Stock VIPER} & \textbf{Spandex TU} \\
+\midrule
+small         & \viperRTsmall   & \spxRTsmall   \\
+medium        & \viperRTmedium  & \spxRTmedium  \\
+large/TL=100  & \viperRTlarge   & \spxRTlarge   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:viper-cmp} compares Spandex TU against stock GPU\_VIPER
+on the random tester. \emph{[Discussion of relative performance fills
+in once VIPER baseline data lands.]}
+
+\subsection{Pannotia HIP benchmarks}
+
+\begin{table}[t]
+\centering
+\caption{Pannotia BC and PageRank, 1k\_128k.gr input.}
+\label{tab:pannotia}
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Benchmark} & \textbf{Stock VIPER} & \textbf{Spandex TU} \\
+\midrule
+BC       & \bcViperTicks & \bcSpxTicks \\
+PageRank & \prViperTicks & \prSpxTicks \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\emph{[Discussion of network-message breakdown, miss rates, and
+sensitivity to the input graph fills in once benchmarks land.]}
+
+\section{Lessons and Future Work}
+
+\textbf{Lessons.} (1)~SLICC bring-up is unforgiving but mechanical:
+trace$\to$fix$\to$rebuild iterates quickly once the workflow is
+established. (2)~gem5's \texttt{MachineType} enum is closed; new
+machine types must be added to \texttt{RubySlicc\_Exports.sm}.
+(3)~\texttt{gem5.opt} is not portable across glibc/Python: HIP
+benchmarks must be run inside the gcn-gpu container with a
+container-built binary.
+
+\textbf{Future work.}
+\emph{CPU-side TU.} Today the CPU L1 reuses the GPU TCP machine in
+\texttt{use\_seq\_not\_coal=True} mode---a Spandex-native device, not
+MESI. A proper CPU TU bridging MOESI CorePair to Spandex would
+fully demonstrate heterogeneous coherence with two device-side L1
+protocols sharing one LLC.
+\emph{Per-word LLC state.} Spandex's headline contribution is per-word
+ownership tracking. Our LLC is line-granular; per-word would
+eliminate the false-sharing penalty between CPU and GPU sharing the
+same line.
+\emph{Sharer tracking and \texttt{Inv} broadcast.} Required to support
+\texttt{ReqS} and \texttt{ReqO} from a real MESI client.
+\emph{L3 eviction with O-inclusivity.} Our directory declares
+\texttt{V\_I} but has no transitions; production-correct Spandex
+sends \texttt{RvkO} to the current owner before dropping an owned line.
+
+\section{Conclusion}
+
+We implemented the Spandex coherence protocol in gem5's Ruby memory
+system with a translation-unit bridge between an unmodified VIPER GPU
+hierarchy and a Spandex LLC. The TU compiles and passes the GPU
+random-protocol tester at all three system sizes, including
+large/TL=100 at \spxRTlarge\ ticks. Our random-tester comparison
+quantifies the cost of preserving VIPER's L1 stack
+(\spxRToverhead\% overhead vs.\ a single-protocol Spandex). The TU
+pattern realises Spandex's central thesis---heterogeneous coherence
+without modifying device IP---and provides a foundation for future
+work toward the paper's full word-granularity, multi-TU architecture.
+
+\begin{thebibliography}{1}
+
+\bibitem{spandex}
+J.~Alsop, M.~D.~Sinclair, and S.~V.~Adve, ``Spandex: A flexible
+interface for efficient heterogeneous coherence,'' in \emph{Proc.\
+ACM/IEEE 45th Int'l Symp.\ Computer Architecture (ISCA)},
+2018, pp.~261--274.
+
+\bibitem{pannotia}
+S.~Che, B.~M.~Beckmann, S.~K.~Reinhardt, and K.~Skadron, ``Pannotia:
+Understanding irregular GPGPU graph applications,'' in \emph{Proc.\
+IEEE Int'l Symp.\ Workload Characterization (IISWC)}, 2013,
+pp.~185--195.
+
+\bibitem{gem5}
+J.~Lowe-Power \emph{et al.}, ``The gem5 simulator: Version 20.0+,''
+\emph{arXiv:2007.03152}, 2020.
+
+\end{thebibliography}
+
+\end{document}
