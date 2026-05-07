@@ -230,6 +230,7 @@ machine(MachineType:SQC, "Spandex GPU SQC (L1 I Cache)")
     enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
       out_msg.addr := address;
       out_msg.Type := SpandexRequestType:ReqV;
+        out_msg.atomicReturn := false;
       out_msg.Requestor := machineID;
       out_msg.Destination.add(mapAddressToRange(address,
                               MachineType:Directory,

@@ -28,6 +28,7 @@ structure(SpandexRequestMsg, desc="Spandex request message",
     WriteMask writeMask,            desc="Which bytes are valid";
     MessageSizeType MessageSize,    desc="Size category";
     uint64_t instSeqNum,            desc="Instruction sequence number";
+  bool atomicReturn, desc="True for AtomicReturn; false for AtomicNoReturn";
 
     bool functionalRead(Packet *pkt) {
         if (Type == SpandexRequestType:ReqWTD ||

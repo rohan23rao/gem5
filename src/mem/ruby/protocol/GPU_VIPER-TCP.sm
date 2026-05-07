@@ -678,8 +678,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   action(wd_wtDone, "wd", desc="writethrough done") {
     if (use_seq_not_coal) {
-      DPRINTF(RubySlicc, "Sequencer does not define writeCompleteCallback!\n");
-      assert(false);
+      // CPU/RubySequencer path: store completion callback was already issued
+      // when the write-through request was generated. Just consume the ack.
+      DPRINTF(RubySlicc, "CPU sequencer write-through ack complete; no writeCompleteCallback needed.\n");
     } else {
       peek(responseToTCP_in, ResponseMsg) {
         coalescer.writeCompleteCallback(address, in_msg.instSeqNum);

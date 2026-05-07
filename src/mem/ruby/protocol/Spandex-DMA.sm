@@ -126,6 +126,7 @@ machine(MachineType:DMA, "Spandex DMA Controller")
       enqueue(requestToDir_out, SpandexRequestMsg, request_latency) {
         out_msg.addr := in_msg.LineAddress;
         out_msg.Type := SpandexRequestType:ReqV;
+        out_msg.atomicReturn := false;
         out_msg.Requestor := machineID;
         out_msg.Destination.add(mapAddressToMachine(address,
                                                    MachineType:Directory));
@@ -139,6 +140,7 @@ machine(MachineType:DMA, "Spandex DMA Controller")
       enqueue(requestToDir_out, SpandexRequestMsg, request_latency) {
         out_msg.addr := in_msg.LineAddress;
         out_msg.Type := SpandexRequestType:ReqWT;
+        out_msg.atomicReturn := false;
         out_msg.Requestor := machineID;
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.writeMask.setMask(

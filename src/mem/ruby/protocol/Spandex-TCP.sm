@@ -262,6 +262,7 @@ machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
     enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
       out_msg.addr := address;
       out_msg.Type := SpandexRequestType:ReqV;
+        out_msg.atomicReturn := false;
       out_msg.Requestor := machineID;
       out_msg.Destination.add(mapAddressToRange(address, MachineType:Directory,
                               TCC_select_low_bit, TCC_select_num_bits));
@@ -274,6 +275,7 @@ machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
       peek(mandatoryQueue_in, RubyRequest) {
         out_msg.addr := address;
         out_msg.Type := SpandexRequestType:ReqWTD;
+        out_msg.atomicReturn := false;
         out_msg.Requestor := machineID;
         out_msg.DataBlk.copyPartial(in_msg.WTData, in_msg.writeMask);
         out_msg.writeMask := in_msg.writeMask;
@@ -291,6 +293,7 @@ machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
     enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
       out_msg.addr := address;
       out_msg.Type := SpandexRequestType:ReqWTD;
+        out_msg.atomicReturn := false;
       out_msg.Requestor := machineID;
       assert(is_valid(cache_entry));
       out_msg.DataBlk := cache_entry.DataBlk;
@@ -311,6 +314,7 @@ machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
       enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
         out_msg.addr := address;
         out_msg.Type := SpandexRequestType:ReqOD;
+        out_msg.atomicReturn := false;
         out_msg.Requestor := machineID;
         out_msg.writeMask.clear();
         out_msg.writeMask.orMask(in_msg.writeMask);
@@ -327,6 +331,7 @@ machine(MachineType:TCP, "Spandex GPU TCP (L1 Data Cache)")
     enqueue(requestNetwork_out, SpandexRequestMsg, issue_latency) {
       out_msg.addr := address;
       out_msg.Type := SpandexRequestType:ReqWB;
+        out_msg.atomicReturn := false;
       out_msg.Requestor := machineID;
       assert(is_valid(cache_entry));
       out_msg.DataBlk := cache_entry.DataBlk;

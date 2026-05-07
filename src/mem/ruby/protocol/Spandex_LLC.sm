@@ -46,7 +46,8 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     // 原本是 V, 收到 replacement signal, 已經送 memory writeback, 正在等 MemAck 回來
     V_I, AccessPermission:Busy,
             desc="Valid victim, memory writeback pending for replacement";
-  }
+  
+    I_A, AccessPermission:Busy, desc="Invalid, waiting for memory data for atomic miss";}
 
   // === EVENTS ===
   enumeration(Event, desc="Simplified Spandex LLC events") {
@@ -65,6 +66,8 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     // Memory controller responses
     MemData,    desc="Data from main memory";     // Data response for read miss of LLC
     MemAck,     desc="Writeback ack from memory"; // Ack for LLC writeback/ write through
+  
+    ReqOD, desc="Atomic ownership/data request (ReqOD)";
   }
 
   // transition 需要讀 tag 和 data 的 request type, 用來記錄在 L3 cache 的 statistics
@@ -98,7 +101,10 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     DataBlock DataBlk,          desc="Data for the block"; // memory 回來的資料會先存在 TBE, 之後再寫進 L3 cache
     MachineID Requestor,        desc="Original requestor, normally the TU"; // read miss 時 request queue 會先 pop 掉，等 memory data 回來時，要知道要回給誰
     uint64_t instSeqNum,        desc="Instruction sequence number"; // response 回去時會帶回去，讓 TU / TCC 可以對應原本 request
-  }
+    DataBlock ReqDataBlk, desc="Saved request data for partial write / atomic";
+  WriteMask ReqWriteMask, desc="Saved write mask / atomic mask";
+  bool atomicReturn, desc="True for AtomicReturn; false for AtomicNoReturn";
+}
 
   structure(TBETable, external="yes") {
     TBE lookup(Addr);
@@ -461,12 +467,7 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     peek(requestToDir_in, SpandexRequestMsg) {
       assert(is_valid(cache_entry));
 
-      // If mask is full, normal full-line overwrite.
-      // If mask is empty, preserve old behavior and treat request as full-line data.
-      // Otherwise, merge only the bytes selected by writeMask.
-      if (in_msg.writeMask.isFull()) {
-        cache_entry.DataBlk := in_msg.DataBlk;
-      } else if (in_msg.writeMask.isEmpty()) {
+      if (in_msg.writeMask.isEmpty()) {
         cache_entry.DataBlk := in_msg.DataBlk;
       } else {
         cache_entry.DataBlk.copyPartial(in_msg.DataBlk, in_msg.writeMask);
@@ -540,7 +541,7 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
   }
 
 // --- Atomic handling ---
-  action(ado_atomicDataOp, "ado", desc="Apply atomic op to L3 and send AtomicResp/AtomicDone") {
+  action(ado_atomicDataOp, "aod", desc="Apply atomic op to L3 and send AtomicResp/AtomicDone") {
     peek(requestToDir_in, SpandexRequestMsg) {
       assert(is_valid(cache_entry));
 
@@ -568,7 +569,65 @@ machine(MachineType:Directory, "Simplified Spandex LLC Controller")
     }
   }
 
-    // --- Queue / wakeup management ---
+  
+  // --- Atomic / ReqOD support ---
+  action(sat_saveAtomicReqToTBE, "sat", desc="Save ReqOD request fields in TBE") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      tbe.Requestor := in_msg.Requestor;
+      tbe.instSeqNum := in_msg.instSeqNum;
+      tbe.ReqDataBlk := in_msg.DataBlk;
+      tbe.ReqWriteMask := in_msg.writeMask;
+      tbe.atomicReturn := in_msg.atomicReturn;
+    }
+  }
+
+  action(ado_atomicDataOpFromReq, "aor", desc="Apply atomic on L3 hit and send response") {
+    peek(requestToDir_in, SpandexRequestMsg) {
+      assert(is_valid(cache_entry));
+
+      DataBlock oldData := cache_entry.DataBlk;
+      cache_entry.DataBlk.atomicPartial(in_msg.DataBlk, in_msg.writeMask);
+
+      enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+        out_msg.addr := address;
+        if (in_msg.atomicReturn) {
+          out_msg.Type := SpandexResponseType:AtomicResp;
+          out_msg.DataBlk := oldData;
+        } else {
+          out_msg.Type := SpandexResponseType:AtomicDone;
+          out_msg.DataBlk := oldData;
+        }
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(ado_atomicDataOpFromTBE, "aot", desc="Apply atomic after memory data returns and send response") {
+    assert(is_valid(cache_entry));
+
+    DataBlock oldData := tbe.DataBlk;
+    cache_entry.DataBlk.atomicPartial(tbe.ReqDataBlk, tbe.ReqWriteMask);
+
+    enqueue(responseNetwork_out, SpandexResponseMsg, response_latency) {
+      out_msg.addr := address;
+      if (tbe.atomicReturn) {
+        out_msg.Type := SpandexResponseType:AtomicResp;
+        out_msg.DataBlk := oldData;
+      } else {
+        out_msg.Type := SpandexResponseType:AtomicDone;
+        out_msg.DataBlk := oldData;
+      }
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(tbe.Requestor);
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.instSeqNum := tbe.instSeqNum;
+    }
+  }
+
+  // --- Queue / wakeup management ---
 
   // pop request queue
   action(prq_popRequestQueue, "prq", desc="Pop request queue") {

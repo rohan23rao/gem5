@@ -244,9 +244,10 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
           trigger(Event:SpxAck, in_msg.addr, tbe);
         } else if (in_msg.Type == SpandexResponseType:WBAck) {
           trigger(Event:SpxWBAck, in_msg.addr, tbe);
-        } else if (in_msg.Type == SpandexResponseType:AtomicResp ||
-                   in_msg.Type == SpandexResponseType:AtomicDone) {
-          error("TU: atomic response received, but atomic is unsupported");
+        } else if (in_msg.Type == SpandexResponseType:AtomicResp) {
+          trigger(Event:SpxAtomicResp, in_msg.addr, tbe);
+        } else if (in_msg.Type == SpandexResponseType:AtomicDone) {
+          trigger(Event:SpxAtomicDone, in_msg.addr, tbe);
         } else {
           error("TU: unexpected SpandexResponseMsg type from Spandex Dir");
         }
@@ -273,9 +274,10 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
           }
         } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
           trigger(Event:WriteFlush, in_msg.addr, tbe);
-        } else if (in_msg.Type == CoherenceRequestType:AtomicReturn ||
-                   in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
-          error("TU: atomic request from TCC is unsupported in this Spandex LLC bring-up");
+        } else if (in_msg.Type == CoherenceRequestType:AtomicReturn) {
+          trigger(Event:AtomicReturn, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
+          trigger(Event:AtomicNoReturn, in_msg.addr, tbe);
         } else {
           DPRINTF(RubySlicc, "TU: unexpected CPURequestMsg type: %s\n",
                   in_msg.Type);
@@ -324,6 +326,7 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
       enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
         out_msg.addr        := address;
         out_msg.Type        := SpandexRequestType:ReqV;
+        out_msg.atomicReturn := false;
         out_msg.Requestor   := machineID;  // TU is the requestor to Dir
         out_msg.Destination.clear();
         out_msg.Destination.add(
@@ -345,6 +348,7 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
       enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
         out_msg.addr        := address;
         out_msg.Type        := SpandexRequestType:ReqWT;
+        out_msg.atomicReturn := false;
         out_msg.Requestor   := machineID;
         out_msg.Destination.clear();
         out_msg.Destination.add(
@@ -366,6 +370,7 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
       enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
         out_msg.addr        := address;
         out_msg.Type        := SpandexRequestType:ReqWB;
+        out_msg.atomicReturn := false;
         out_msg.Requestor   := machineID;
         out_msg.Destination.clear();
         out_msg.Destination.add(
@@ -387,6 +392,7 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
       enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
         out_msg.addr        := address;
         out_msg.Type        := SpandexRequestType:ReqWB;
+        out_msg.atomicReturn := false;
         out_msg.Requestor   := machineID;
         out_msg.Destination.clear();
         out_msg.Destination.add(
@@ -407,7 +413,26 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
   // the simplified Spandex LLC has no ReqOD / RMW path.
 
 
-  // ── Downward translation: SpandexResponseMsg → ResponseMsg ────────────
+  
+// AtomicReturn / AtomicNoReturn -> ReqOD
+action(ta_translateAtomic, "ta", desc="Translate AtomicReturn/AtomicNoReturn -> ReqOD and forward to Spandex Dir") {
+  peek(requestFromTCC_in, CPURequestMsg) {
+    enqueue(requestToDir_out, SpandexRequestMsg, tu_latency) {
+      out_msg.addr := address;
+      out_msg.Type := SpandexRequestType:ReqOD;
+      out_msg.atomicReturn := (in_msg.Type == CoherenceRequestType:AtomicReturn);
+      out_msg.Requestor := machineID;
+      out_msg.Destination.clear();
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.DataBlk := in_msg.DataBlk;
+      out_msg.writeMask := in_msg.writeMask;
+      out_msg.MessageSize := MessageSizeType:Data;
+      out_msg.instSeqNum := in_msg.instSeqNum;
+    }
+  }
+}
+
+// ── Downward translation: SpandexResponseMsg → ResponseMsg ────────────
   //
   // All responses sent back to TCC must look exactly like what the MOESI NB
   // would have sent.  Key fields TCC checks:
@@ -635,7 +660,36 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
   // AtomicReturn / AtomicNoReturn are rejected in requestFromTCC_in above.
   // Therefore TU never sends ReqOD and should never wait for AtomicResp/Done.
 
-  // ── Unblock absorption ────────────────────────────────────────────────
+  
+  // ── Atomic with return value ──────────────────────────────────────────
+  transition(I, AtomicReturn, W) {
+    t_allocateTBE;
+    ta_translateAtomic;
+    p_popRequestQueue;
+  }
+
+  transition(W, SpxAtomicResp, I) {
+    far_forwardAtomicResp;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  // ── Atomic without return value ───────────────────────────────────────
+  transition(I, AtomicNoReturn, W) {
+    t_allocateTBE;
+    ta_translateAtomic;
+    p_popRequestQueue;
+  }
+
+  transition(W, SpxAtomicDone, I) {
+    fad_forwardAtomicDone;
+    w_wakeUp;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+// ── Unblock absorption ────────────────────────────────────────────────
   // TCC sends UnblockMsg (vnet 4) after sdr_sendDataResponse / rb_bypassDone.
   // The Spandex Dir does not need unblock messages — absorb silently.
   // This can arrive in either state (TBE may have been released already).
@@ -647,7 +701,7 @@ machine(MachineType:Spandex_TU, "Spandex Translation Unit")
   // If a new request arrives for an address already in state W
   // (previous request still in-flight to Spandex Dir), stall it.
   // wakeUpAllBuffers in the completion transitions will retry it.
-  transition(W, {RdBlk, WriteThrough, WriteBack, WriteFlush}) {
+  transition(W, {RdBlk, WriteThrough, WriteBack, WriteFlush, AtomicReturn, AtomicNoReturn}) {
     z_stallAndWait;
   }
 }
