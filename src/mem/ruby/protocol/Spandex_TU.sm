@@ -690,6 +690,17 @@ machine(MachineType:TU, "Spandex Translation Unit")
     pu_popUnblockQueue;
   }
 
+  // ── Late / stale Spandex responses arriving with no TBE ──────────────
+  // Under apu_se.py multi-process traffic (HSA + GPU CmdProc + CPU host)
+  // the LLC can occasionally deliver a response after the TU has already
+  // completed and freed its TBE for that address (e.g., due to timing of
+  // the Dir's wakeUpAllBuffers vs. the TU's response forwarding). Rather
+  // than panic on (I, Spx*), drop the late response and continue. This
+  // matches the canonical SLICC pattern for benign-stale responses.
+  transition(I, {SpxData, SpxAck, SpxWBAck, SpxAtomicResp, SpxAtomicDone}) {
+    pr_popResponseQueue;
+  }
+
   // ── Stall concurrent requests ─────────────────────────────────────────
   // If a new request arrives for an address already in state W
   // (previous request still in-flight to Spandex Dir), stall it.
